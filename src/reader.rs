@@ -1,17 +1,37 @@
 use anyhow::anyhow;
 use arrow::array::{Array, ArrayRef, StringArray};
-use async_stream::stream;
+use arrow::ipc::reader::StreamReader;
+use async_stream::{stream, try_stream};
 use clap::ValueEnum;
 use csv_async::AsyncReader;
-use futures::{Stream, StreamExt};
+use futures::{Stream, StreamExt, TryStreamExt};
+use opendal::services::Huggingface;
+use opendal::services::S3;
 use opendal::{Operator, services::Fs};
 use parquet::arrow::{ParquetRecordBatchStreamBuilder, ProjectionMask};
-use parquet::basic::LogicalType;
 use serde::Serialize;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::{collections::HashMap, error::Error};
 use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio_util::compat::FuturesAsyncReadCompatExt;
+use tokio_util::io::ReaderStream;
+
+#[derive(Debug, Clone, ValueEnum)]
+pub enum ReaderBackend {
+    Fs,
+    S3,
+    HuggingFace,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReaderConfig {
+    pub input_url_column_name: String,
+    pub input_caption_column_name: Option<String>,
+    pub save_additional_columns: bool,
+    pub input_format: InputFormat,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ArrayData {
     pub index: usize,
@@ -39,18 +59,19 @@ pub enum InputFormat {
     Parquet,
 }
 
+impl InputFormat {
+    pub fn extension(&self) -> &str {
+        match self {
+            InputFormat::Txt => "txt",
+            InputFormat::Csv => "csv",
+            InputFormat::Parquet => "parquet",
+        }
+    }
+}
+
 pub struct Reader {
-    path: String,
-    input_format: InputFormat,
-    url_col: String,
-    caption_col: Option<String>,
-    save_additional_columns: bool,
-    number_of_items_per_shard: usize,
-    max_shard_size: usize,
-    shard_count: usize,
-    start_shard: usize,
-    end_shard: Option<usize>,
-    operator: Arc<Operator>,
+    op: Arc<Operator>,
+    reader_config: ReaderConfig,
 }
 
 type SampleStream =
@@ -58,109 +79,89 @@ type SampleStream =
 
 impl Reader {
     pub fn new(
-        path: &str,
-        input_format: InputFormat,
-        url_col: &str,
-        caption_col: Option<&str>,
-        save_additional_columns: bool,
-        number_of_items_per_shard: usize,
-        shard_count: usize,
-        start_shard: usize,
-        end_shard: Option<usize>,
+        backend: ReaderBackend,
+        base_path: &str,
+        reader_config: ReaderConfig,
     ) -> Result<Self, Box<dyn Error>> {
-        let mut builder = Fs::default();
-        builder.root("/");
-        let op = Operator::new(builder)?.finish();
-
-        // Simplified for now, will implement properly later
-        let max_shard_size = 1024 * 1024 * 1024; // 1GB
+        let op = match backend {
+            ReaderBackend::Fs => Operator::new(Fs::default().root(base_path))?.finish(),
+            ReaderBackend::S3 => Operator::new(S3::default().root(base_path))?.finish(),
+            ReaderBackend::HuggingFace => {
+                Operator::new(Huggingface::default().root(base_path))?.finish()
+            }
+        };
 
         Ok(Self {
-            path: path.to_string(),
-            input_format,
-            url_col: url_col.to_string(),
-            caption_col: caption_col.map(|s| s.to_string()),
-            save_additional_columns,
-            number_of_items_per_shard,
-            max_shard_size,
-            shard_count,
-            start_shard,
-            end_shard,
-            operator: Arc::new(op),
+            op: Arc::new(op),
+            reader_config,
         })
     }
 
-    pub fn shards(
-        &self,
-    ) -> impl Stream<Item = Result<Vec<Sample>, Box<dyn Error + Send + Sync>>> + '_ {
-        stream! {
-            let sample_stream = self.get_sample_stream().await.unwrap(); // This unwrap is bad, fix it
-            let mut shard = Vec::with_capacity(self.number_of_items_per_shard);
-            let mut current_shard_size = 0;
+    pub async fn stream_samples(&self) -> Result<SampleStream, Box<dyn Error + Send + Sync>> {
+        let file_lister = self.op.lister_with("").recursive(true).await?;
+        let config = self.reader_config.clone();
+        let op = self.op.clone();
 
-            for await sample in sample_stream {
-                let sample = sample?;
-                let sample_size = sample.url.len() + sample.caption.as_deref().unwrap_or("").len(); // Approximate size
-                if shard.len() >= self.number_of_items_per_shard || current_shard_size + sample_size > self.max_shard_size {
-                    yield Ok(shard);
-                    shard = Vec::with_capacity(self.number_of_items_per_shard);
-                    current_shard_size = 0;
+        let stream_of_streams = stream! {
+            let mut file_lister = file_lister;
+            while let Some(file) = file_lister.next().await {
+                log::debug!("Listing file: {:?}", file);
+                match file {
+                    Ok(file) => {
+                        if file.name().ends_with(config.input_format.extension()) {
+                            let path = file.path().to_string();
+                            let reader = op.reader_with(&path.clone()).await?;
+                            let config_clone = config.clone();
+
+                            let stream_result = match config_clone.input_format {
+                                InputFormat::Txt => {
+                                    read_txt_stream(
+                                        reader,
+                                        config_clone,
+                                    ).await
+                                }
+                                InputFormat::Csv => {
+                                    read_csv_stream(
+                                        reader,
+                                        config_clone,
+                                    )
+                                    .await
+
+                                }
+                                InputFormat::Parquet => {
+                                    read_parquet_stream(
+                                        reader,
+                                        config_clone,
+                                    )
+                                    .await
+                                }
+                            };
+                            yield stream_result;
+                        }
+                    }
+                    Err(e) => {
+                        log::error!("Error listing file: {}", e);
+                        yield Err(e.into());
+                    }
                 }
-                current_shard_size += sample_size;
-                shard.push(sample);
-            }
-            if !shard.is_empty() {
-                yield Ok(shard);
-            }
-        }
-    }
-
-    async fn get_sample_stream(&self) -> Result<SampleStream, Box<dyn Error + Send + Sync>> {
-        let op = self.operator.clone();
-        let path = self.path.clone();
-        let url_col = self.url_col.clone();
-        let caption_col = self.caption_col.clone();
-        let save_additional_columns = self.save_additional_columns;
-
-        let stream: SampleStream = match self.input_format {
-            InputFormat::Txt => {
-                let stream = read_txt_stream(op, path).await?;
-                Box::pin(stream)
-            }
-            InputFormat::Csv => {
-                let stream =
-                    read_csv_stream(op, path, url_col, caption_col, save_additional_columns)
-                        .await?;
-                Box::pin(stream)
-            }
-            InputFormat::Parquet => {
-                let stream = read_parquet_stream(
-                    op,
-                    path,
-                    url_col,
-                    caption_col,
-                    save_additional_columns,
-                )
-                .await?;
-                Box::pin(stream)
             }
         };
-        Ok(stream)
+
+        let flattened_stream = stream_of_streams.try_flatten();
+        Ok(Box::pin(flattened_stream))
     }
 }
 
 async fn read_txt_stream(
-    op: Arc<Operator>,
-    path: String,
-) -> Result<
-    impl Stream<Item = Result<Sample, Box<dyn Error + Send + Sync>>>,
-    Box<dyn Error + Send + Sync>,
-> {
-    let reader = op.reader(&path).await?;
-    let buf_reader = BufReader::new(reader);
+    reader: opendal::Reader,
+    config: ReaderConfig,
+) -> Result<SampleStream, Box<dyn Error + Send + Sync>> {
+    let buf_reader = BufReader::new(reader.into_futures_async_read(..).await?.compat());
+    let mut lines = buf_reader.lines();
     let stream = stream! {
-        let mut lines = buf_reader.lines();
-        while let Some(new_line) = lines.next_line().await? {
+        while let Some(new_line_result) = lines.next_line().await.transpose() {
+            let new_line = new_line_result.unwrap();
+            log::debug!("Reading line: {:?}", new_line);
             // assuming each line is a URL
             if new_line.trim().is_empty() {
                 continue; // skip empty lines
@@ -173,31 +174,25 @@ async fn read_txt_stream(
             });
         }
     };
-    Ok(stream)
+    Ok(Box::pin(stream))
 }
 
 async fn read_csv_stream(
-    op: Arc<Operator>,
-    path: String,
-    input_url_col: String,
-    input_caption_col: Option<String>,
-    save_additional_columns: bool,
-) -> Result<
-    impl Stream<Item = Result<Sample, Box<dyn Error + Send + Sync>>>,
-    Box<dyn Error + Send + Sync>,
-> {
-    let reader = op.reader(&path).await?;
-    let mut csv_reader = AsyncReader::from_reader(reader);
+    reader: opendal::Reader,
+    config: ReaderConfig,
+) -> Result<SampleStream, Box<dyn Error + Send + Sync>> {
+    let mut csv_reader =
+        AsyncReader::from_reader(reader.into_futures_async_read(..).await?.compat());
     let headers = csv_reader.headers().await?.clone();
 
-    // Create an indexed map of additional column names to save
     let additional_column_names: HashMap<String, usize> = headers
         .iter()
         .enumerate()
         .filter_map(|(i, h)| {
-            if save_additional_columns
-                && (h != input_url_col
-                    && (input_caption_col.is_none() || h != input_caption_col.as_deref().unwrap()))
+            if config.save_additional_columns
+                && (h != config.input_url_column_name
+                    && (config.input_caption_column_name.is_none()
+                        || h != config.input_caption_column_name.as_deref().unwrap()))
             {
                 Some((h.to_string(), i))
             } else {
@@ -207,9 +202,14 @@ async fn read_csv_stream(
         .collect();
     let url_col_idx = headers
         .iter()
-        .position(|h| h == input_url_col)
-        .ok_or_else(|| anyhow!("URL column '{}' not found in headers", input_url_col))?;
-    let caption_col_idx = match input_caption_col.as_deref() {
+        .position(|h| h == config.input_url_column_name)
+        .ok_or_else(|| {
+            anyhow!(
+                "URL column '{}' not found in headers",
+                config.input_url_column_name
+            )
+        })?;
+    let caption_col_idx = match config.input_caption_column_name.as_deref() {
         Some(col) => Some(
             headers
                 .iter()
@@ -259,63 +259,68 @@ async fn read_csv_stream(
             }
         }
     };
-
-    Ok(stream)
+    Ok(Box::pin(stream))
 }
 
 async fn read_parquet_stream(
-    op: Arc<Operator>,
-    path: String,
-    url_col: String,
-    caption_col: Option<String>,
-    save_additional_columns: bool,
-) -> Result<
-    impl Stream<Item = Result<Sample, Box<dyn Error + Send + Sync>>>,
-    Box<dyn Error + Send + Sync>,
-> {
-    // Step 1: Read the Parquet file and extract the columns to ids index
-    let reader = op.reader(&path).await?;
-    let builder = ParquetRecordBatchStreamBuilder::new(reader).await?;
-    let file_metadata = builder.metadata().file_metadata();
-    let schema_desc = file_metadata.schema_descr();
+    reader: opendal::Reader,
+    config: ReaderConfig,
+) -> Result<SampleStream, Box<dyn Error + Send + Sync>> {
+    let builder =
+        ParquetRecordBatchStreamBuilder::new(reader.into_futures_async_read(..).await?.compat())
+            .await
+            .map_err(|e| anyhow!("Failed to create Parquet reader: {}", e))?;
 
-    let columns = schema_desc.columns();
+    let schema = builder.schema().clone();
     let mut col_name_to_idx: HashMap<String, usize> = HashMap::new();
-    for (i, field) in schema_desc.columns().iter().enumerate() {
+    for (i, field) in schema.fields().iter().enumerate() {
         col_name_to_idx.insert(field.name().to_string(), i);
     }
 
-    // Step 2: Get the wanted indices for the columns
+    // Get the wanted indices for the columns
     let mut wanted_indices: Vec<usize> = Vec::new();
     let mut additional_col_names: Vec<String> = Vec::new();
 
     // a. Handle url_col
     let url_col_idx = *col_name_to_idx
-        .get(&url_col)
-        .ok_or_else(|| anyhow!("URL column '{}' not found in Parquet file", url_col))?;
-    let url_col_desc = &columns[url_col_idx];
-    if url_col_desc.logical_type() != Some(LogicalType::String) {
-        return Err(anyhow!("URL column '{}' must be of type String", url_col).into());
+        .get(&config.input_url_column_name)
+        .ok_or_else(|| {
+            anyhow!(
+                "URL column '{}' not found in Parquet file",
+                config.input_url_column_name
+            )
+        })?;
+    if !matches!(
+        schema.field(url_col_idx).data_type(),
+        arrow::datatypes::DataType::Utf8
+    ) {
+        return Err(anyhow!(
+            "URL column '{}' must be of type String",
+            config.input_url_column_name
+        )
+        .into());
     }
     wanted_indices.push(url_col_idx);
 
     // b. Handle caption_col (optional but required if specified)
-    let caption_col_idx = if let Some(col_name) = caption_col.as_deref() {
+    let caption_col_idx = if let Some(col_name) = config.input_caption_column_name.as_deref() {
         let idx = *col_name_to_idx
             .get(col_name)
             .ok_or_else(|| anyhow!("Caption column '{}' not found in Parquet file", col_name))?;
-        wanted_indices.push(idx);
-        let caption_col_desc = &columns[idx];
-        if caption_col_desc.logical_type() != Some(LogicalType::String) {
+        if !matches!(
+            schema.field(idx).data_type(),
+            arrow::datatypes::DataType::Utf8
+        ) {
             return Err(anyhow!("Caption column '{}' must be of type String", col_name).into());
         }
+        wanted_indices.push(idx);
         Some(idx)
     } else {
         None
     };
 
     // c. If save_additional_columns is true, collect additional columns
-    if save_additional_columns {
+    if config.save_additional_columns {
         for (name, &idx) in &col_name_to_idx {
             if idx != url_col_idx && caption_col_idx.map_or(true, |c_idx| idx != c_idx) {
                 wanted_indices.push(idx);
@@ -324,19 +329,24 @@ async fn read_parquet_stream(
         }
     }
 
-    // Step 3: Create the projection mask and build the reader
-    let projection = ProjectionMask::roots(schema_desc, wanted_indices);
-    let mut arrow_reader = builder.with_projection(projection).build()?;
+    let projection = ProjectionMask::roots(builder.parquet_schema(), wanted_indices);
+    let mut record_batch_reader = builder.with_projection(projection).build()?;
 
-    // Step 4: Find the indices of the URL, caption, and additional columns
-    let projected_schema = arrow_reader.schema();
+    // Find the indices of the URL, caption, and additional columns in the projected schema
+    let projected_schema = record_batch_reader.schema();
     let url_idx_proj = projected_schema
-        .index_of(&url_col)
-        .map_err(|_| anyhow!("URL column '{}' not found in projected schema", url_col))?;
-    let caption_idx_proj =
-        caption_col.and_then(|name| projected_schema.index_of(&name).ok());
+        .index_of(&config.input_url_column_name)
+        .map_err(|_| {
+            anyhow!(
+                "URL column '{}' not found in projected schema",
+                config.input_url_column_name
+            )
+        })?;
+    let caption_idx_proj = config
+        .input_caption_column_name
+        .as_deref()
+        .and_then(|name| projected_schema.index_of(name).ok());
     let additional_col_indices: HashMap<String, usize> = additional_col_names
-        .clone()
         .into_iter()
         .map(|name| {
             let idx = projected_schema.index_of(&name).unwrap();
@@ -345,9 +355,7 @@ async fn read_parquet_stream(
         .collect();
 
     let stream = stream! {
-        let mut batch_num = 0;
-        while let Some(result) = arrow_reader.next().await {
-            log::info!("Processing batch {}", batch_num);
+        while let Some(result) = record_batch_reader.next().await {
             let record_batch = match result {
                 Ok(batch) => batch,
                 Err(e) => {
@@ -368,9 +376,8 @@ async fn read_parquet_stream(
                 Some(idx) => record_batch.column(idx).as_any().downcast_ref::<StringArray>(),
                 None => None,
             };
-            let additional_arrays: Vec<(&str, ArrayRef)> = additional_col_names.iter().map(|name| {
-                let idx = additional_col_indices.get(name).unwrap();
-                let array = record_batch.column(*idx);
+            let additional_arrays: Vec<(&str, ArrayRef)> = additional_col_indices.iter().map(|(name, &idx)| {
+                let array = record_batch.column(idx);
                 (name.as_str(), array.clone())
             }).collect();
 
@@ -395,9 +402,8 @@ async fn read_parquet_stream(
                     additional_columns,
                 });
             }
-            batch_num += 1;
         }
     };
 
-    Ok(stream)
+    Ok(Box::pin(stream))
 }

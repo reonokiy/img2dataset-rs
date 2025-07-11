@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT success FROM download_info WHERE url = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "success",
+        "ordinal": 0,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "69fa5a2c99000907abd80764dd5dd42a35edaf20e30bc140ed1e95cf056022d5"
+}
