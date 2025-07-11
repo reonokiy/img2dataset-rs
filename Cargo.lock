@@ -1465,6 +1465,7 @@ dependencies = [
  "rayon",
  "reqwest",
  "serde",
+ "serde_json",
  "tar",
  "tokio",
  "tokio-util",

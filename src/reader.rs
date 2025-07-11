@@ -1,22 +1,25 @@
 use anyhow::anyhow;
 use arrow::array::{Array, ArrayRef, StringArray};
 use async_stream::stream;
+use clap::ValueEnum;
 use csv_async::AsyncReader;
 use futures::{Stream, StreamExt};
 use opendal::{Operator, services::Fs};
 use parquet::arrow::{ParquetRecordBatchStreamBuilder, ProjectionMask};
 use parquet::basic::LogicalType;
+use serde::Serialize;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::{collections::HashMap, error::Error};
 use tokio::io::{AsyncBufReadExt, BufReader};
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ArrayData {
     pub index: usize,
+    #[serde(skip_serializing)]
     pub reference: ArrayRef,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub enum SampleData {
     Array(ArrayData),
     String(String),
@@ -29,7 +32,7 @@ pub struct Sample {
     pub additional_columns: HashMap<String, SampleData>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum InputFormat {
     Txt,
     Csv,
@@ -131,9 +134,14 @@ impl Reader {
                 Box::pin(stream)
             }
             InputFormat::Parquet => {
-                let stream =
-                    read_parquet_stream(op, path, url_col, caption_col, save_additional_columns)
-                        .await?;
+                let stream = read_parquet_stream(
+                    op,
+                    path,
+                    url_col,
+                    caption_col,
+                    save_additional_columns,
+                )
+                .await?;
                 Box::pin(stream)
             }
         };
@@ -292,9 +300,9 @@ async fn read_parquet_stream(
     wanted_indices.push(url_col_idx);
 
     // b. Handle caption_col (optional but required if specified)
-    let caption_col_idx = if let Some(col_name) = caption_col.clone() {
+    let caption_col_idx = if let Some(col_name) = caption_col.as_deref() {
         let idx = *col_name_to_idx
-            .get(&col_name)
+            .get(col_name)
             .ok_or_else(|| anyhow!("Caption column '{}' not found in Parquet file", col_name))?;
         wanted_indices.push(idx);
         let caption_col_desc = &columns[idx];
@@ -325,7 +333,8 @@ async fn read_parquet_stream(
     let url_idx_proj = projected_schema
         .index_of(&url_col)
         .map_err(|_| anyhow!("URL column '{}' not found in projected schema", url_col))?;
-    let caption_idx_proj = caption_col.and_then(|name| projected_schema.index_of(&name).ok());
+    let caption_idx_proj =
+        caption_col.and_then(|name| projected_schema.index_of(&name).ok());
     let additional_col_indices: HashMap<String, usize> = additional_col_names
         .clone()
         .into_iter()
