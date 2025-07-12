@@ -278,11 +278,14 @@ impl OutputSample {
     }
 
     pub fn to_image_file(&self) -> Result<(String, Vec<u8>)> {
-        let extension = self
-            .download_mime_type
-            .as_ref()
-            .and_then(|mime| mime.split('/').last())
-            .unwrap_or("jpg");
+        let extension = match &self.download_mime_type {
+            Some(mime_type) => match mime_type.as_str() {
+                "image/jpeg" => "jpg",
+                "image/png" => "png",
+                _ => "jpg", // Fallback for unknown types
+            },
+            None => "jpg", // Fallback if no mime type is provided
+        };
         let image_path = format!("{}.{}", self.id, extension);
         Ok((image_path, self.download_data.clone()))
     }

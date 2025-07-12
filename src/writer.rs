@@ -38,72 +38,60 @@ impl FromStr for OutputFormat {
 
 #[derive(Debug, Clone)]
 pub struct WriterOptions {
-    pub base_path: String,
+    pub root: String,
+    pub format: OutputFormat,
+    pub backend: OutputBackend,
     pub s3_bucket: Option<String>,
     pub s3_region: Option<String>,
     pub s3_access_key: Option<String>,
     pub s3_secret_key: Option<String>,
     pub s3_endpoint: Option<String>,
-    pub output_backend: OutputBackend,
-    pub output_format: OutputFormat,
-    pub write_concurrent_limit: usize,
-    pub number_sample_per_shard: usize,
+    pub writer_concurrent_limit: usize,
     pub webdataset_shard_bits_num: usize,
     pub webdataset_shard_prefix: String,
 }
 
-/// The `Writer` is responsible for writing samples to the output destination.
 #[derive(Debug, Clone)]
 pub struct Writer {
     op: Operator,
-    output_format: OutputFormat,
-    write_concurrent_limit: usize,
-    // for webdataset
-    webdataset_shard_bits_num: usize,
-    webdataset_shard_prefix: String,
+    options: WriterOptions,
 }
 
 static WRITER_SHARD_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 impl Writer {
     pub fn new(options: WriterOptions) -> Result<Self> {
-        let op = match options.output_backend {
+        let op = match &options.backend {
             OutputBackend::Fs => {
-                let builder = Fs::default().root(&options.base_path);
+                let builder = Fs::default().root(&options.root);
                 Operator::new(builder)?.finish()
             }
             OutputBackend::S3 => {
-                let mut builder = S3::default().root(&options.base_path);
-                if let Some(bucket) = options.s3_bucket {
-                    builder = builder.bucket(&bucket);
+                let mut builder = S3::default().root(&options.root);
+                if let Some(bucket) = &options.s3_bucket {
+                    builder = builder.bucket(bucket);
                 }
-                if let Some(region) = options.s3_region {
-                    builder = builder.region(&region);
+                if let Some(region) = &options.s3_region {
+                    builder = builder.region(region);
                 }
-                if let Some(access_key) = options.s3_access_key {
-                    builder = builder.access_key_id(&access_key);
+                if let Some(access_key) = &options.s3_access_key {
+                    builder = builder.access_key_id(access_key);
                 }
-                if let Some(secret_key) = options.s3_secret_key {
-                    builder = builder.secret_access_key(&secret_key);
+                if let Some(secret_key) = &options.s3_secret_key {
+                    builder = builder.secret_access_key(secret_key);
                 }
-                if let Some(endpoint) = options.s3_endpoint {
-                    builder = builder.endpoint(&endpoint);
+                if let Some(endpoint) = &options.s3_endpoint {
+                    builder = builder.endpoint(endpoint);
                 }
                 Operator::new(builder)?.finish()
             }
         };
 
-        Ok(Self {
-            op,
-            output_format: options.output_format,
-            write_concurrent_limit: options.write_concurrent_limit,
-            webdataset_shard_bits_num: options.webdataset_shard_bits_num,
-            webdataset_shard_prefix: options.webdataset_shard_prefix,
-        })
+        Ok(Self { op, options })
     }
 
     pub fn output_format(&self) -> OutputFormat {
-        self.output_format
+        self.options.format
     }
 
     pub async fn write_streaming_samples_to_files<S>(&self, samples: S, state: &State) -> Result<()>
@@ -112,7 +100,7 @@ impl Writer {
     {
         samples
             .map(Ok)
-            .try_for_each_concurrent(self.write_concurrent_limit, |sample| {
+            .try_for_each_concurrent(self.options.writer_concurrent_limit, |sample| {
                 let state = state;
                 async move {
                     match (sample.to_image_file(), sample.to_json_file()) {
@@ -146,8 +134,8 @@ impl Writer {
         let shard_id = WRITER_SHARD_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         format!(
             "{}-{:0>5}.tar",
-            self.webdataset_shard_prefix,
-            shard_id & ((1 << self.webdataset_shard_bits_num) - 1)
+            self.options.webdataset_shard_prefix,
+            shard_id & ((1 << self.options.webdataset_shard_bits_num) - 1)
         )
     }
 
@@ -169,21 +157,23 @@ impl Writer {
 
         while let Some(sample) = samples.next().await {
             state.set_download_state(&sample.url, false).await?;
-            let (image_path, image_data) = sample.to_image_file()?;
             let (json_path, json_data) = sample.to_json_file()?;
+            let (image_path, image_data) = sample.to_image_file()?;
+            let mut json_header = async_tar::Header::new_gnu();
+            json_header.set_path(json_path.clone())?;
+            json_header.set_size(json_data.len() as u64);
+            json_header.set_mode(0o644);
+            json_header.set_cksum();
             tar_writer
-                .append_data(
-                    &mut async_tar::Header::new_gnu(),
-                    image_path,
-                    image_data.as_slice(),
-                )
+                .append_data(&mut json_header, json_path, json_data.as_slice())
                 .await?;
+            let mut image_header = async_tar::Header::new_gnu();
+            image_header.set_path(image_path.clone())?;
+            image_header.set_size(image_data.len() as u64);
+            image_header.set_mode(0o644);
+            image_header.set_cksum();
             tar_writer
-                .append_data(
-                    &mut async_tar::Header::new_gnu(),
-                    json_path,
-                    json_data.as_slice(),
-                )
+                .append_data(&mut image_header, image_path, image_data.as_slice())
                 .await?;
             state.set_download_state(&sample.url, true).await?;
         }

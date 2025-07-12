@@ -30,7 +30,7 @@ impl Downloader {
         retries: u32,
     ) -> Self {
         let user_agent_string =
-            "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:72.0) Gecko/20100101 Firefox/72.0"
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36"
                 .to_string()
                 + &user_agent_token
                     .as_ref()
@@ -72,7 +72,7 @@ impl Downloader {
     /// A `Result` containing the image data as a `Vec<u8>` and the MIME type as a `String`.
     pub async fn download(&self, input: InputSample) -> Result<OutputSample> {
         let mut last_err = None;
-        for _ in 0..=self.retries {
+        for i in 0..=self.retries {
             match self.client.get(input.url.clone()).send().await {
                 Ok(response) => {
                     if self.is_disallowed(&response) {
@@ -84,6 +84,7 @@ impl Downloader {
                         .and_then(|v| v.to_str().ok())
                         .map(|s| s.to_string());
                     let data = response.bytes().await?.to_vec();
+                    log::info!("Successfully downloaded {}", input.url);
                     return Ok({
                         OutputSample {
                             id: input.id,
@@ -98,6 +99,7 @@ impl Downloader {
                     });
                 }
                 Err(e) => {
+                    log::warn!("[Try {}] Failed to download {}: {}", i, input.url, e);
                     last_err = Some(e);
                 }
             }

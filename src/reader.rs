@@ -23,11 +23,21 @@ pub enum ReaderBackend {
 }
 
 #[derive(Debug, Clone)]
-pub struct ReaderConfig {
+pub struct ReaderOptions {
+    pub format: InputFormat,
+    pub backend: ReaderBackend,
+    pub root: String,
+    pub s3_bucket: Option<String>,
+    pub s3_region: Option<String>,
+    pub s3_access_key: Option<String>,
+    pub s3_secret_key: Option<String>,
+    pub s3_endpoint: Option<String>,
+    pub huggingface_token: Option<String>,
+    pub huggingface_repo_id: Option<String>,
+    pub huggingface_revision: Option<String>,
     pub input_url_column_name: String,
     pub input_caption_column_name: Option<String>,
     pub save_additional_columns: bool,
-    pub input_format: InputFormat,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -49,35 +59,64 @@ impl InputFormat {
 
 pub struct Reader {
     op: Arc<Operator>,
-    reader_config: ReaderConfig,
+    options: ReaderOptions,
 }
 
 type SampleStream =
     Pin<Box<dyn Stream<Item = Result<InputSample, Box<dyn Error + Send + Sync>>> + Send>>;
 
 impl Reader {
-    pub fn new(
-        backend: ReaderBackend,
-        base_path: &str,
-        reader_config: ReaderConfig,
-    ) -> Result<Self, Box<dyn Error>> {
-        let op = match backend {
-            ReaderBackend::Fs => Operator::new(Fs::default().root(base_path))?.finish(),
-            ReaderBackend::S3 => Operator::new(S3::default().root(base_path))?.finish(),
+    pub fn new(options: ReaderOptions) -> Result<Self, Box<dyn Error>> {
+        let op = match options.backend {
+            ReaderBackend::Fs => {
+                let builder = Fs::default().root(&options.root);
+                Operator::new(builder)?.finish()
+            }
+            ReaderBackend::S3 => {
+                let mut builder = S3::default().root(&options.root);
+                if let Some(bucket) = &options.s3_bucket {
+                    builder = builder.bucket(bucket);
+                }
+                if let Some(region) = &options.s3_region {
+                    builder = builder.region(region);
+                }
+                if let Some(access_key) = &options.s3_access_key {
+                    builder = builder.access_key_id(access_key);
+                }
+                if let Some(secret_key) = &options.s3_secret_key {
+                    builder = builder.secret_access_key(secret_key);
+                }
+                if let Some(endpoint) = &options.s3_endpoint {
+                    builder = builder.endpoint(endpoint);
+                }
+                Operator::new(builder)?.finish()
+            }
             ReaderBackend::HuggingFace => {
-                Operator::new(Huggingface::default().root(base_path))?.finish()
+                let mut builder = Huggingface::default()
+                    .root(&options.root)
+                    .repo_type("dataset");
+                if let Some(token) = &options.huggingface_token {
+                    builder = builder.token(token);
+                }
+                if let Some(repo) = &options.huggingface_repo_id {
+                    builder = builder.repo_id(repo);
+                }
+                if let Some(revision) = &options.huggingface_revision {
+                    builder = builder.revision(revision);
+                }
+                Operator::new(builder)?.finish()
             }
         };
 
         Ok(Self {
             op: Arc::new(op),
-            reader_config,
+            options,
         })
     }
 
     pub async fn stream_samples(&self) -> Result<SampleStream, Box<dyn Error + Send + Sync>> {
         let file_lister = self.op.lister_with("").recursive(true).await?;
-        let config = self.reader_config.clone();
+        let config = self.options.clone();
         let op = self.op.clone();
 
         let stream_of_streams = stream! {
@@ -86,12 +125,12 @@ impl Reader {
                 log::debug!("Listing file: {:?}", file);
                 match file {
                     Ok(file) => {
-                        if file.name().ends_with(config.input_format.extension()) {
+                        if file.name().ends_with(config.format.extension()) {
                             let path = file.path().to_string();
                             let reader = op.reader_with(&path.clone()).await?;
                             let config_clone = config.clone();
 
-                            let stream_result = match config_clone.input_format {
+                            let stream_result = match config_clone.format {
                                 InputFormat::Txt => {
                                     read_txt_stream(
                                         path.clone(),
@@ -136,7 +175,7 @@ impl Reader {
 async fn read_txt_stream(
     filepath: String,
     reader: opendal::Reader,
-    config: ReaderConfig,
+    options: ReaderOptions,
 ) -> Result<SampleStream, Box<dyn Error + Send + Sync>> {
     let buf_reader = BufReader::new(reader.into_futures_async_read(..).await?.compat());
     let mut lines = buf_reader.lines();
@@ -166,7 +205,7 @@ async fn read_txt_stream(
 async fn read_csv_stream(
     filepath: String,
     reader: opendal::Reader,
-    config: ReaderConfig,
+    options: ReaderOptions,
 ) -> Result<SampleStream, Box<dyn Error + Send + Sync>> {
     let mut csv_reader =
         AsyncReader::from_reader(reader.into_futures_async_read(..).await?.compat());
@@ -176,10 +215,10 @@ async fn read_csv_stream(
         .iter()
         .enumerate()
         .filter_map(|(i, h)| {
-            if config.save_additional_columns
-                && (h != config.input_url_column_name
-                    && (config.input_caption_column_name.is_none()
-                        || h != config.input_caption_column_name.as_deref().unwrap()))
+            if options.save_additional_columns
+                && (h != options.input_url_column_name
+                    && (options.input_caption_column_name.is_none()
+                        || h != options.input_caption_column_name.as_deref().unwrap()))
             {
                 Some((h.to_string(), i))
             } else {
@@ -189,14 +228,14 @@ async fn read_csv_stream(
         .collect();
     let url_col_idx = headers
         .iter()
-        .position(|h| h == config.input_url_column_name)
+        .position(|h| h == options.input_url_column_name)
         .ok_or_else(|| {
             anyhow!(
                 "URL column '{}' not found in headers",
-                config.input_url_column_name
+                options.input_url_column_name
             )
         })?;
-    let caption_col_idx = match config.input_caption_column_name.as_deref() {
+    let caption_col_idx = match options.input_caption_column_name.as_deref() {
         Some(col) => Some(
             headers
                 .iter()
@@ -256,7 +295,7 @@ async fn read_csv_stream(
 async fn read_parquet_stream(
     filepath: String,
     reader: opendal::Reader,
-    config: ReaderConfig,
+    options: ReaderOptions,
 ) -> Result<SampleStream, Box<dyn Error + Send + Sync>> {
     let builder =
         ParquetRecordBatchStreamBuilder::new(reader.into_futures_async_read(..).await?.compat())
@@ -275,11 +314,11 @@ async fn read_parquet_stream(
 
     // a. Handle url_col
     let url_col_idx = *col_name_to_idx
-        .get(&config.input_url_column_name)
+        .get(&options.input_url_column_name)
         .ok_or_else(|| {
             anyhow!(
                 "URL column '{}' not found in Parquet file",
-                config.input_url_column_name
+                options.input_url_column_name
             )
         })?;
     if !matches!(
@@ -288,14 +327,14 @@ async fn read_parquet_stream(
     ) {
         return Err(anyhow!(
             "URL column '{}' must be of type String",
-            config.input_url_column_name
+            options.input_url_column_name
         )
         .into());
     }
     wanted_indices.push(url_col_idx);
 
     // b. Handle caption_col (optional but required if specified)
-    let caption_col_idx = if let Some(col_name) = config.input_caption_column_name.as_deref() {
+    let caption_col_idx = if let Some(col_name) = options.input_caption_column_name.as_deref() {
         let idx = *col_name_to_idx
             .get(col_name)
             .ok_or_else(|| anyhow!("Caption column '{}' not found in Parquet file", col_name))?;
@@ -312,7 +351,7 @@ async fn read_parquet_stream(
     };
 
     // c. If save_additional_columns is true, collect additional columns
-    if config.save_additional_columns {
+    if options.save_additional_columns {
         for (name, &idx) in &col_name_to_idx {
             if idx != url_col_idx && caption_col_idx.map_or(true, |c_idx| idx != c_idx) {
                 wanted_indices.push(idx);
@@ -327,14 +366,14 @@ async fn read_parquet_stream(
     // Find the indices of the URL, caption, and additional columns in the projected schema
     let projected_schema = record_batch_reader.schema();
     let url_idx_proj = projected_schema
-        .index_of(&config.input_url_column_name)
+        .index_of(&options.input_url_column_name)
         .map_err(|_| {
             anyhow!(
                 "URL column '{}' not found in projected schema",
-                config.input_url_column_name
+                options.input_url_column_name
             )
         })?;
-    let caption_idx_proj = config
+    let caption_idx_proj = options
         .input_caption_column_name
         .as_deref()
         .and_then(|name| projected_schema.index_of(name).ok());
