@@ -1,7 +1,9 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use reqwest::{Client, Response};
 use std::collections::HashSet;
 use std::time::Duration;
+
+use crate::sampler::{InputSample, OutputSample};
 
 /// The `Downloader` is responsible for downloading images from URLs.
 #[derive(Clone)]
@@ -68,10 +70,10 @@ impl Downloader {
     /// # Returns
     ///
     /// A `Result` containing the image data as a `Vec<u8>` and the MIME type as a `String`.
-    pub async fn download(&self, url: &str) -> Result<(Vec<u8>, String)> {
+    pub async fn download(&self, input: InputSample) -> Result<OutputSample> {
         let mut last_err = None;
         for _ in 0..=self.retries {
-            match self.client.get(url).send().await {
+            match self.client.get(input.url.clone()).send().await {
                 Ok(response) => {
                     if self.is_disallowed(&response) {
                         return Err(anyhow!("X-Robots-Tag disallowed"));
@@ -80,10 +82,20 @@ impl Downloader {
                         .headers()
                         .get("Content-Type")
                         .and_then(|v| v.to_str().ok())
-                        .unwrap_or("image/jpeg")
-                        .to_string();
+                        .map(|s| s.to_string());
                     let data = response.bytes().await?.to_vec();
-                    return Ok((data, mime_type));
+                    return Ok({
+                        OutputSample {
+                            id: input.id,
+                            original_filepath: input.original_filepath,
+                            download_data: data,
+                            download_mime_type: mime_type.map(|s| s.to_string()),
+                            download_timestamp: Some(chrono::Utc::now()),
+                            url: input.url,
+                            caption: input.caption,
+                            additional_columns: input.additional_columns,
+                        }
+                    });
                 }
                 Err(e) => {
                     last_err = Some(e);

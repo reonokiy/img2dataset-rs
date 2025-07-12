@@ -1,18 +1,21 @@
 use crate::downloader::Downloader;
-use crate::reader::{InputFormat, Reader, ReaderBackend, ReaderConfig, Sample};
+use crate::reader::{InputFormat, Reader, ReaderBackend, ReaderConfig};
 use crate::resizer::{ResizeMode, Resizer};
+use crate::sampler::OutputSample;
 use crate::state::State;
-use crate::writer::{OutputFormat, Writer};
+use crate::writer::{OutputBackend, OutputFormat, Writer, WriterOptions};
 use anyhow::Result;
 use anyhow::anyhow;
 use clap::{ArgGroup, Parser, Subcommand};
-use futures::stream::StreamExt;
+use futures::stream::{self, Stream, StreamExt, TryStreamExt};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
 
 pub mod downloader;
 pub mod reader;
 pub mod resizer;
+mod sampler;
 mod state;
 pub mod writer;
 
@@ -119,6 +122,12 @@ struct Args {
     resume: bool,
     #[clap(long, default_value = ".")]
     db_path: PathBuf,
+    #[clap(long, default_value = "100")]
+    write_concurrent_limit: usize,
+    #[clap(long, default_value = "10")]
+    webdataset_shard_bits_num: usize,
+    #[clap(long, default_value = "shard")]
+    webdataset_shard_prefix: String,
 }
 
 #[tokio::main]
@@ -181,6 +190,43 @@ async fn run_downloader(args: Args) -> Result<()> {
     log::info!("Starting downloader with args: {:?}", args);
 
     let state = Arc::new(State::new(Path::new(&args.db_path)).await?);
+
+    let (reader_backend, path) = if let Some(dir) = &args.input_directory {
+        (ReaderBackend::Fs, dir.clone())
+    } else if let Some(file) = &args.input_file {
+        (ReaderBackend::Fs, file.clone())
+    } else if let Some(dataset) = &args.input_hf_dataset {
+        (ReaderBackend::HuggingFace, dataset.clone())
+    } else {
+        unreachable!() // Clap group should prevent this
+    };
+
+    let reader_config = ReaderConfig {
+        input_url_column_name: args.url_col.clone(),
+        input_caption_column_name: args.caption_col.clone(),
+        save_additional_columns: args.save_additional_columns,
+        input_format: args.input_format,
+    };
+
+    let reader = Reader::new(reader_backend, &path, reader_config)
+        .map_err(|e| anyhow!("Failed to create reader: {}", e.to_string()))?;
+
+    let writer_options = WriterOptions {
+        base_path: args.output_folder,
+        s3_bucket: None, // Add logic to get these from args if needed
+        s3_region: None,
+        s3_access_key: None,
+        s3_secret_key: None,
+        s3_endpoint: None,
+        output_backend: OutputBackend::Fs, // Assuming Fs, add logic for S3
+        output_format: args.output_format,
+        write_concurrent_limit: args.write_concurrent_limit,
+        number_sample_per_shard: args.number_of_items_per_shard,
+        webdataset_shard_bits_num: args.webdataset_shard_bits_num,
+        webdataset_shard_prefix: args.webdataset_shard_prefix,
+    };
+    let writer = Arc::new(Writer::new(writer_options)?);
+
     let resizer = Arc::new(Resizer::new(
         args.resize_mode,
         args.image_size,
@@ -195,116 +241,66 @@ async fn run_downloader(args: Args) -> Result<()> {
         args.retries,
     ));
 
-    let (backend, path) = if let Some(dir) = args.input_directory {
-        (ReaderBackend::Fs, dir)
-    } else if let Some(file) = args.input_file {
-        // Assuming url_list is a file path for now, can be adjusted
-        (ReaderBackend::Fs, file)
-    } else if let Some(dataset) = args.input_hf_dataset {
-        (ReaderBackend::HuggingFace, dataset)
-    } else {
-        unreachable!() // Clap group should prevent this
-    };
-
-    let reader_config = ReaderConfig {
-        input_url_column_name: args.url_col.clone(),
-        input_caption_column_name: args.caption_col.clone(),
-        save_additional_columns: args.save_additional_columns,
-        input_format: args.input_format,
-    };
-
-    let reader = Reader::new(backend, &path, reader_config)
-        .map_err(|e| anyhow!("Failed to create reader: {}", e.to_string()))?;
     let sample_stream = reader
         .stream_samples()
         .await
         .map_err(|e| anyhow!("Failed to stream samples: {}", e.to_string()))?;
 
     let thread_count = args.thread_count;
-    let shard_id_start = args.shard_id_start;
     let number_of_items_per_shard = args.number_of_items_per_shard;
-    let resume = args.resume;
 
-    let (tx, mut rx) = tokio::sync::mpsc::channel(thread_count);
+    let download_stream = sample_stream
+        .map_err(|e| anyhow!(e.to_string()))
+        .map_ok(move |sample| {
+            let downloader = downloader.clone();
+            async move { downloader.download(sample).await }
+        })
+        .try_buffer_unordered(thread_count);
 
-    let writer = Arc::new(Writer::new(
-        &args.output_folder,
-        args.output_format,
-        shard_id_start,
-        args.save_additional_columns,
-        &args.image_format,
-    ));
-
-    let writer_handle = tokio::spawn({
-        let writer = writer.clone();
-        let shard_size = number_of_items_per_shard;
-        async move {
-            let mut shard_id = shard_id_start;
-            let mut buffer: Vec<(Sample, Vec<u8>, String)> = Vec::new();
-            while let Some((sample, resized_image, mime_type)) = rx.recv().await {
-                buffer.push((sample, resized_image, mime_type));
-                if buffer.len() >= shard_size {
-                    if let Err(e) = writer.write_shard(shard_id, buffer.clone()) {
-                        log::error!("Error writing shard {}: {}", shard_id, e);
-                    }
-                    buffer.clear();
-                    shard_id += 1;
+    let processing_stream: Pin<Box<dyn Stream<Item = Result<OutputSample>> + Send>> =
+        if args.resize_mode != ResizeMode::No {
+            let resizer = resizer.clone();
+            Box::pin(download_stream.and_then(move |mut downloaded_sample| {
+                let resizer = resizer.clone();
+                async move {
+                    downloaded_sample.download_data =
+                        resizer.resize(&downloaded_sample.download_data)?;
+                    Ok(downloaded_sample)
                 }
-            }
-            // Write any remaining items in the buffer
-            if !buffer.is_empty() {
-                if let Err(e) = writer.write_shard(shard_id, buffer.clone()) {
-                    log::error!("Error writing final shard {}: {}", shard_id, e);
-                }
+            }))
+        } else {
+            Box::pin(download_stream)
+        };
+
+    let final_stream = Box::pin(processing_stream.filter_map(|res| async {
+        match res {
+            Ok(sample) => Some(sample),
+            Err(e) => {
+                log::error!("An error occurred during processing: {}", e);
+                None
             }
         }
-    });
+    }));
 
-    sample_stream
-        .for_each_concurrent(Some(thread_count), |sample_result| {
-            let downloader = downloader.clone();
-            let resizer = resizer.clone();
-            let state = state.clone();
-            let tx = tx.clone();
+    let mut chunk_stream = final_stream.chunks(number_of_items_per_shard);
 
-            async move {
-                match sample_result {
-                    Ok(sample) => {
-                        if resume {
-                            if let Ok(Some(true)) = state.get_download_state(&sample.url).await {
-                                return; // Already succeeded, skip
-                            }
-                        }
-
-                        let url = sample.url.clone();
-                        let download_result = downloader.download(&url).await;
-                        let success = download_result.is_ok();
-
-                        // Update state immediately after download attempt
-                        if let Err(e) = state.set_download_state(&url, success).await {
-                            log::error!("Failed to set download state for {}: {}", url, e);
-                        }
-
-                        if let Ok((image_data, mime_type)) = download_result {
-                            if let Ok(resized_image) = resizer.resize(&image_data) {
-                                if tx.send((sample, resized_image, mime_type)).await.is_err() {
-                                    log::error!("Failed to send sample to writer");
-                                }
-                            } else {
-                                log::warn!("Error resizing {}", url);
-                            }
-                        } else {
-                            log::warn!("Error downloading {}", url);
-                        }
-                    }
-                    Err(e) => log::error!("Error reading sample: {}", e),
-                }
+    while let Some(chunk) = chunk_stream.next().await {
+        match writer.output_format() {
+            OutputFormat::Files => {
+                writer
+                    .write_streaming_samples_to_files(stream::iter(chunk), &state)
+                    .await?;
             }
-        })
-        .await;
-
-    drop(tx); // Close the channel
-    writer_handle.await?; // Wait for the writer to finish
+            OutputFormat::Webdataset => {
+                writer
+                    .write_streaming_samples_to_tar(stream::iter(chunk), &state)
+                    .await?;
+            }
+            OutputFormat::Parquet => {
+                log::warn!("Parquet output format is not yet implemented.");
+            }
+        }
+    }
 
     Ok(())
 }

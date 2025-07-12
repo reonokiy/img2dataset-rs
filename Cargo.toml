@@ -24,7 +24,6 @@ opendal = { version = "0.53.3", features = [
 ] }
 reqwest = { version = "0.12.22", features = ["stream", "json"] }
 serde = { version = "1.0.219", features = ["derive"] }
-tar = "0.4.44"
 tokio = { version = "1.46.1", features = ["full"] }
 tokio-util = { version = "0.7.11", features = ["io", "compat"] }
 tracing = "0.1.41"
@@ -38,3 +37,6 @@ sqlx = { version = "0.8", features = [
 ] }
 arrow = { version = "55.2.0", features = ["ipc"] }
 parquet = { version = "55.2.0", features = ["arrow", "async"] }
+chrono = { version = "0.4.41", features = ["serde"] }
+base64 = "0.22.1"
+async-tar = "0.5.0"

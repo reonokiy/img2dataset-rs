@@ -1,7 +1,7 @@
+use crate::sampler::{InputSample, InputSampleColumnData, get_ith_element_from_array};
 use anyhow::anyhow;
 use arrow::array::{Array, ArrayRef, StringArray};
-use arrow::ipc::reader::StreamReader;
-use async_stream::{stream, try_stream};
+use async_stream::stream;
 use clap::ValueEnum;
 use csv_async::AsyncReader;
 use futures::{Stream, StreamExt, TryStreamExt};
@@ -9,13 +9,11 @@ use opendal::services::Huggingface;
 use opendal::services::S3;
 use opendal::{Operator, services::Fs};
 use parquet::arrow::{ParquetRecordBatchStreamBuilder, ProjectionMask};
-use serde::Serialize;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::{collections::HashMap, error::Error};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio_util::compat::FuturesAsyncReadCompatExt;
-use tokio_util::io::ReaderStream;
 
 #[derive(Debug, Clone, ValueEnum)]
 pub enum ReaderBackend {
@@ -30,26 +28,6 @@ pub struct ReaderConfig {
     pub input_caption_column_name: Option<String>,
     pub save_additional_columns: bool,
     pub input_format: InputFormat,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct ArrayData {
-    pub index: usize,
-    #[serde(skip_serializing)]
-    pub reference: ArrayRef,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub enum SampleData {
-    Array(ArrayData),
-    String(String),
-}
-
-#[derive(Debug, Clone)]
-pub struct Sample {
-    pub url: String,
-    pub caption: Option<String>,
-    pub additional_columns: HashMap<String, SampleData>,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -75,7 +53,7 @@ pub struct Reader {
 }
 
 type SampleStream =
-    Pin<Box<dyn Stream<Item = Result<Sample, Box<dyn Error + Send + Sync>>> + Send>>;
+    Pin<Box<dyn Stream<Item = Result<InputSample, Box<dyn Error + Send + Sync>>> + Send>>;
 
 impl Reader {
     pub fn new(
@@ -116,12 +94,14 @@ impl Reader {
                             let stream_result = match config_clone.input_format {
                                 InputFormat::Txt => {
                                     read_txt_stream(
+                                        path.clone(),
                                         reader,
                                         config_clone,
                                     ).await
                                 }
                                 InputFormat::Csv => {
                                     read_csv_stream(
+                                        path.clone(),
                                         reader,
                                         config_clone,
                                     )
@@ -130,6 +110,7 @@ impl Reader {
                                 }
                                 InputFormat::Parquet => {
                                     read_parquet_stream(
+                                        path.clone(),
                                         reader,
                                         config_clone,
                                     )
@@ -153,11 +134,13 @@ impl Reader {
 }
 
 async fn read_txt_stream(
+    filepath: String,
     reader: opendal::Reader,
     config: ReaderConfig,
 ) -> Result<SampleStream, Box<dyn Error + Send + Sync>> {
     let buf_reader = BufReader::new(reader.into_futures_async_read(..).await?.compat());
     let mut lines = buf_reader.lines();
+    let mut id = 0;
     let stream = stream! {
         while let Some(new_line_result) = lines.next_line().await.transpose() {
             let new_line = new_line_result.unwrap();
@@ -167,17 +150,21 @@ async fn read_txt_stream(
                 continue; // skip empty lines
             }
             let url = new_line.trim().to_string();
-            yield Ok(Sample {
+            yield Ok(InputSample {
+                id: id,
+                original_filepath: filepath.clone(),
                 url,
                 caption: None,
                 additional_columns: HashMap::new(),
             });
+            id += 1;
         }
     };
     Ok(Box::pin(stream))
 }
 
 async fn read_csv_stream(
+    filepath: String,
     reader: opendal::Reader,
     config: ReaderConfig,
 ) -> Result<SampleStream, Box<dyn Error + Send + Sync>> {
@@ -219,6 +206,7 @@ async fn read_csv_stream(
         None => None,
     };
 
+    let mut id = 0;
     let stream = stream! {
         let mut records = csv_reader.into_records();
         while let Some(result) = records.next().await {
@@ -240,18 +228,21 @@ async fn read_csv_stream(
                         if let Some(value) = record.get(*idx) {
                             additional_columns.insert(
                                 name.clone(),
-                                SampleData::String(
+                                InputSampleColumnData::String(
                                     value.to_string(),
                                 )
                             );
                         }
                     }
 
-                    yield Ok(Sample {
+                    yield Ok(InputSample {
+                        id: id,
+                        original_filepath: filepath.clone(),
                         url,
                         caption,
                         additional_columns,
                     });
+                    id += 1;
                 },
                 Err(e) => {
                     yield Err(e.into());
@@ -263,6 +254,7 @@ async fn read_csv_stream(
 }
 
 async fn read_parquet_stream(
+    filepath: String,
     reader: opendal::Reader,
     config: ReaderConfig,
 ) -> Result<SampleStream, Box<dyn Error + Send + Sync>> {
@@ -354,6 +346,7 @@ async fn read_parquet_stream(
         })
         .collect();
 
+    let mut id = 0;
     let stream = stream! {
         while let Some(result) = record_batch_reader.next().await {
             let record_batch = match result {
@@ -387,20 +380,29 @@ async fn read_parquet_stream(
 
                 let mut additional_columns = HashMap::new();
                 for (name, array) in &additional_arrays {
+                    let data = match get_ith_element_from_array(array, i) {
+                        Ok(Some(data)) => data,
+                        Ok(None) => continue, // Skip if the value is None
+                        Err(e) => {
+                            yield Err(e.into());
+                            continue;
+                        }
+                    };
+
                     additional_columns.insert(
                         name.to_string(),
-                        SampleData::Array(ArrayData {
-                            index: i,
-                            reference: array.slice(i, 1),
-                        }),
+                        data,
                     );
                 }
 
-                yield Ok(Sample {
+                yield Ok(InputSample {
+                    id: id,
+                    original_filepath: filepath.clone(),
                     url,
                     caption,
                     additional_columns,
                 });
+                id += 1;
             }
         }
     };

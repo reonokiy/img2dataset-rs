@@ -1,11 +1,11 @@
 use anyhow::{Result, anyhow};
+use clap::ValueEnum;
 use image::{DynamicImage, GenericImageView, ImageFormat, imageops::FilterType};
 use std::io::Cursor;
 use std::str::FromStr;
-use clap::ValueEnum;
 
 /// Defines the available resizing modes.
-#[derive(Debug, Clone, Copy, ValueEnum)]
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
 pub enum ResizeMode {
     /// Resizes the image to fit within the target dimensions while
     /// preserving the aspect ratio, and adds a border if necessary.
@@ -60,7 +60,10 @@ impl Resizer {
                 let img = image::load_from_memory(image_data)?;
                 let (width, height) = img.dimensions();
 
-                if self.resize_only_if_bigger && width <= self.image_size && height <= self.image_size {
+                if self.resize_only_if_bigger
+                    && width <= self.image_size
+                    && height <= self.image_size
+                {
                     return Ok(image_data.to_vec());
                 }
 
