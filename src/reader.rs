@@ -170,12 +170,39 @@ impl Reader {
         let flattened_stream = stream_of_streams.try_flatten();
         Ok(Box::pin(flattened_stream))
     }
+
+    pub async fn stream_samples_from(
+        &self,
+        skip_samples: usize,
+    ) -> Result<SampleStream, Box<dyn Error + Send + Sync>> {
+        let base_stream = self.stream_samples().await?;
+
+        let filtered_stream = base_stream
+            .enumerate()
+            .filter_map(move |(index, sample_result)| {
+                async move {
+                    if index < skip_samples {
+                        None // Skip this sample
+                    } else {
+                        match sample_result {
+                            Ok(mut sample) => {
+                                sample.id = index - skip_samples; // Adjust ID
+                                Some(Ok(sample))
+                            }
+                            Err(e) => Some(Err(e)),
+                        }
+                    }
+                }
+            });
+
+        Ok(Box::pin(filtered_stream))
+    }
 }
 
 async fn read_txt_stream(
     filepath: String,
     reader: opendal::Reader,
-    options: ReaderOptions,
+    _options: ReaderOptions,
 ) -> Result<SampleStream, Box<dyn Error + Send + Sync>> {
     let buf_reader = BufReader::new(reader.into_futures_async_read(..).await?.compat());
     let mut lines = buf_reader.lines();

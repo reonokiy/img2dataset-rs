@@ -237,6 +237,12 @@ pub struct InputSample {
     pub additional_columns: HashMap<String, InputSampleColumnData>,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub enum SampleStatus {
+    Success,
+    Failure(String),
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct OutputSample {
     pub id: usize,
@@ -247,6 +253,7 @@ pub struct OutputSample {
     pub download_mime_type: Option<String>,
     pub download_timestamp: Option<DateTime<chrono::Utc>>,
     pub additional_columns: HashMap<String, InputSampleColumnData>,
+    pub status: SampleStatus,
 }
 
 impl OutputSample {

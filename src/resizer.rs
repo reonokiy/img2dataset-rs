@@ -3,6 +3,7 @@ use clap::ValueEnum;
 use image::{DynamicImage, GenericImageView, ImageFormat, imageops::FilterType};
 use std::io::Cursor;
 use std::str::FromStr;
+use crate::sampler::{OutputSample, SampleStatus};
 
 /// Defines the available resizing modes.
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
@@ -52,8 +53,26 @@ impl Resizer {
         }
     }
 
+    /// Resizes an OutputSample's image data.
+    pub fn resize(&self, mut sample: OutputSample) -> Result<OutputSample> {
+        if sample.status != SampleStatus::Success {
+            return Ok(sample);
+        }
+        
+        match self.resize_image_data(&sample.download_data) {
+            Ok(resized_data) => {
+                sample.download_data = resized_data;
+                Ok(sample)
+            }
+            Err(e) => {
+                sample.status = SampleStatus::Failure(format!("Resize failed: {}", e));
+                Ok(sample)
+            }
+        }
+    }
+
     /// Resizes an image.
-    pub fn resize(&self, image_data: &[u8]) -> Result<Vec<u8>> {
+    pub fn resize_image_data(&self, image_data: &[u8]) -> Result<Vec<u8>> {
         match self.resize_mode {
             ResizeMode::No => Ok(image_data.to_vec()),
             ResizeMode::Border => {
