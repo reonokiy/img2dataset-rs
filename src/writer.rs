@@ -46,6 +46,7 @@ pub struct WriterOptions {
     pub s3_secret_key: Option<String>,
     pub s3_endpoint: Option<String>,
     pub b2_bucket: Option<String>,
+    pub b2_bucket_id: Option<String>,
     pub b2_application_key_id: Option<String>,
     pub b2_application_key: Option<String>,
     pub writer_thread_count: usize,
@@ -89,6 +90,9 @@ impl Writer {
                 let mut builder = opendal::services::B2::default().root(&options.root);
                 if let Some(bucket) = &options.b2_bucket {
                     builder = builder.bucket(bucket);
+                }
+                if let Some(bucket_id) = &options.b2_bucket_id {
+                    builder = builder.bucket_id(bucket_id);
                 }
                 if let Some(application_key_id) = &options.b2_application_key_id {
                     builder = builder.application_key_id(application_key_id);

@@ -168,7 +168,7 @@ struct Args {
     resize_only_if_bigger: bool,
     #[clap(long, default_value_t = u64::MAX)]
     max_items_to_download: u64,
-    #[clap(long, default_value_t = 10)]
+    #[clap(long, default_value_t = 60)]
     timeout: u64,
     #[clap(long, default_value_t = 0)]
     retries: u32,
@@ -236,6 +236,8 @@ struct Args {
     output_s3_endpoint: Option<String>,
     #[clap(long)]
     output_b2_bucket: Option<String>,
+    #[clap(long)]
+    output_b2_bucket_id: Option<String>,
     #[clap(long)]
     output_b2_application_key_id: Option<String>,
     #[clap(long)]
@@ -386,6 +388,7 @@ async fn main_run(args: Args) -> Result<()> {
         s3_secret_key: args.output_s3_secret_key,
         s3_endpoint: args.output_s3_endpoint,
         b2_bucket: args.output_b2_bucket,
+        b2_bucket_id: args.output_b2_bucket_id,
         b2_application_key_id: args.output_b2_application_key_id,
         b2_application_key: args.output_b2_application_key,
         writer_thread_count: args.downloader_thread_count,
