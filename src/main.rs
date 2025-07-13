@@ -234,6 +234,12 @@ struct Args {
     output_s3_secret_key: Option<String>,
     #[clap(long)]
     output_s3_endpoint: Option<String>,
+    #[clap(long)]
+    output_b2_bucket: Option<String>,
+    #[clap(long)]
+    output_b2_application_key_id: Option<String>,
+    #[clap(long)]
+    output_b2_application_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -379,6 +385,9 @@ async fn main_run(args: Args) -> Result<()> {
         s3_access_key: args.output_s3_access_key,
         s3_secret_key: args.output_s3_secret_key,
         s3_endpoint: args.output_s3_endpoint,
+        b2_bucket: args.output_b2_bucket,
+        b2_application_key_id: args.output_b2_application_key_id,
+        b2_application_key: args.output_b2_application_key,
         writer_thread_count: args.downloader_thread_count,
         webdataset_shard_bits_num: args.writer_webdataset_shard_bits_num,
         webdataset_shard_prefix: args.writer_webdataset_shard_prefix,

@@ -19,6 +19,7 @@ pub enum OutputFormat {
 pub enum OutputBackend {
     Fs,
     S3,
+    B2,
 }
 
 impl FromStr for OutputFormat {
@@ -44,6 +45,9 @@ pub struct WriterOptions {
     pub s3_access_key: Option<String>,
     pub s3_secret_key: Option<String>,
     pub s3_endpoint: Option<String>,
+    pub b2_bucket: Option<String>,
+    pub b2_application_key_id: Option<String>,
+    pub b2_application_key: Option<String>,
     pub writer_thread_count: usize,
     pub webdataset_shard_bits_num: usize,
     pub webdataset_shard_prefix: String,
@@ -78,6 +82,19 @@ impl Writer {
                 }
                 if let Some(endpoint) = &options.s3_endpoint {
                     builder = builder.endpoint(endpoint);
+                }
+                Operator::new(builder)?.finish()
+            }
+            OutputBackend::B2 => {
+                let mut builder = opendal::services::B2::default().root(&options.root);
+                if let Some(bucket) = &options.b2_bucket {
+                    builder = builder.bucket(bucket);
+                }
+                if let Some(application_key_id) = &options.b2_application_key_id {
+                    builder = builder.application_key_id(application_key_id);
+                }
+                if let Some(application_key) = &options.b2_application_key {
+                    builder = builder.application_key(application_key);
                 }
                 Operator::new(builder)?.finish()
             }
