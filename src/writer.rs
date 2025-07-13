@@ -1,10 +1,15 @@
-use crate::sampler::OutputSample;
+use crate::sampler::{BatchSample, OutputSample, merge_batch_samples};
 use anyhow::Result;
+use arrow::array::{Array, RecordBatch};
+use arrow::datatypes::{DataType, Field, Schema};
 use clap::ValueEnum;
 use futures::{AsyncWriteExt, Stream, StreamExt, TryStreamExt};
 use opendal::Operator;
 use opendal::services::{Fs, S3};
+use parquet::arrow::{ArrowWriter, AsyncArrowWriter};
 use std::str::FromStr;
+use std::sync::Arc;
+use tokio_util::compat::FuturesAsyncWriteCompatExt;
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum OutputFormat {
@@ -212,6 +217,47 @@ impl Writer {
 
         tar_writer.finish().await?;
         tar_writer.into_inner().await?.close().await?;
+
+        Ok(())
+    }
+
+    pub async fn write_shard_parquet(
+        &self,
+        shard_id: usize,
+        samples: Vec<BatchSample>,
+    ) -> Result<()> {
+        let merged_samples = merge_batch_samples(samples)?;
+        let mut schema_vec = vec![
+            Field::new("id", DataType::UInt64, false),
+            Field::new("url", DataType::Utf8, false),
+        ];
+        let mut array_vec: Vec<Arc<dyn Array>> =
+            vec![Arc::new(merged_samples.uuid), Arc::new(merged_samples.url)];
+        if let Some(caption) = merged_samples.caption {
+            schema_vec.push(Field::new("caption", DataType::Utf8, true));
+            array_vec.push(Arc::new(caption));
+        }
+        if let Some(bytes) = merged_samples.bytes {
+            schema_vec.push(Field::new("bytes", DataType::Binary, true));
+            array_vec.push(Arc::new(bytes));
+        }
+        for (key, value) in merged_samples.additional_columns.iter() {
+            schema_vec.push(Field::new(key, value.data_type().clone(), true));
+            array_vec.push(value.clone());
+        }
+        let schema = Arc::new(Schema::new(schema_vec));
+        let batch = RecordBatch::try_new(schema.clone(), array_vec)?;
+        let writer = self
+            .op
+            .writer_with(&format!("{}.parquet", self.get_shard_name(shard_id)))
+            .await?;
+        let mut writer = AsyncArrowWriter::try_new(
+            writer.into_futures_async_write().compat_write(),
+            schema.clone(),
+            None,
+        )?;
+        writer.write(&batch).await?;
+        writer.close().await?;
 
         Ok(())
     }

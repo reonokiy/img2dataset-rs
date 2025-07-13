@@ -1,5 +1,7 @@
+use crate::sampler::BatchSample;
 use crate::sampler::{InputSample, InputSampleColumnData, get_ith_element_from_array};
 use anyhow::anyhow;
+use arrow::array::FixedSizeBinaryBuilder;
 use arrow::array::{Array, ArrayRef, StringArray};
 use async_stream::stream;
 use clap::ValueEnum;
@@ -474,4 +476,87 @@ async fn read_parquet_stream(
     };
 
     Ok(Box::pin(stream))
+}
+
+async fn read_batch_parquet(
+    reader: opendal::Reader,
+    options: ReaderOptions,
+) -> anyhow::Result<impl Stream<Item = anyhow::Result<BatchSample>> + Send> {
+    let builder =
+        ParquetRecordBatchStreamBuilder::new(reader.into_futures_async_read(..).await?.compat())
+            .await
+            .map_err(|e| anyhow!("Failed to create Parquet reader: {}", e))?;
+    let mut record_batch_reader = builder.with_batch_size(1024).build()?;
+    let schema = record_batch_reader.schema();
+    let additional_col_names: Vec<String> = if options.save_additional_columns {
+        schema
+            .fields()
+            .iter()
+            .filter_map(|field| {
+                if *field.name() != options.input_url_column_name
+                    && (options.input_caption_column_name.is_some()
+                        && *field.name() != *options.input_caption_column_name.as_ref().unwrap())
+                {
+                    Some(field.name().to_string())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    } else {
+        vec![]
+    };
+
+    let stream = stream! {
+        while let Some(Ok(batch)) = record_batch_reader.next().await {
+            let mut uuid_builder = FixedSizeBinaryBuilder::new(16); // 16 bytes for UUID v7
+            for _ in 0..batch.num_rows() {
+                uuid_builder.append_value(&uuid::Uuid::now_v7().as_bytes())?;
+            }
+            let uuid = uuid_builder.finish();
+            let url = match batch.column_by_name(&options.input_url_column_name)
+            .expect("URL column should exist")
+            .as_any().downcast_ref::<StringArray>() {
+                Some(arr) => arr,
+                None => {
+                    yield Err(anyhow!("URL column is not of type String"));
+                    continue;
+                }
+            };
+
+            let caption = match options.input_caption_column_name {
+                Some(ref caption_column_name) => match batch.column_by_name(&caption_column_name)
+                .expect("Caption column should exist")
+                .as_any().downcast_ref::<StringArray>() {
+                    Some(arr) => Some(arr),
+                    None => {
+                        yield Err(anyhow!("Caption column is not of type String"));
+                        continue;
+                    }
+                },
+                None => None,
+            };
+
+            let mut additional_columns = HashMap::new();
+            for name in &additional_col_names {
+                let array = batch.column_by_name(name)
+                    .ok_or_else(|| anyhow!("Column '{}' not found in batch", name))?;
+                additional_columns.insert(
+                    name.clone(),
+                    array.clone(),
+                );
+            }
+
+            yield Ok(BatchSample {
+                len: batch.num_rows(),
+                uuid: uuid.clone(),
+                url: url.clone(),
+                caption: caption.map(|c| c.clone()),
+                bytes: None,
+                additional_columns: additional_columns,
+            })
+        }
+    };
+
+    Ok(stream)
 }

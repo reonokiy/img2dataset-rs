@@ -2025,6 +2025,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arrow",
+ "arrow-select",
  "async-stream",
  "async-tar",
  "axum",
@@ -2057,6 +2058,7 @@ dependencies = [
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
