@@ -433,7 +433,7 @@ async fn main_run(args: Args) -> Result<()> {
 
         let mut shard_id_counter = shard_id;
         let writer_clone = writer.clone();
-        
+
         let samples = stream_samples
             .map(move |maybe_sample| {
                 // Track memory usage with process stats
@@ -479,8 +479,7 @@ async fn main_run(args: Args) -> Result<()> {
 
                     let result = downloader.download(sample).await;
                     let download_duration = download_start.elapsed();
-                    histogram!("download_duration_seconds")
-                        .record(download_duration.as_secs_f64());
+                    histogram!("download_duration_seconds").record(download_duration.as_secs_f64());
                     result
                 }
             })
@@ -489,8 +488,7 @@ async fn main_run(args: Args) -> Result<()> {
                 match &sample.status {
                     SampleStatus::Success => {
                         counter!("download_success_total").increment(1);
-                        histogram!("download_size_bytes")
-                            .record(sample.download_data.len() as f64);
+                        histogram!("download_size_bytes").record(sample.download_data.len() as f64);
                         log::debug!(
                             "Downloaded sample ID {}: {} bytes",
                             sample.id,
