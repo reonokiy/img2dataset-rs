@@ -2,7 +2,6 @@ use crate::downloader::Downloader;
 use crate::reader::{InputFormat, Reader, ReaderBackend, ReaderOptions};
 use crate::resizer::{ResizeMode, Resizer};
 use crate::sampler::OutputSample;
-use crate::state::State;
 use crate::writer::{OutputBackend, OutputFormat, Writer, WriterOptions};
 use anyhow::Result;
 use anyhow::anyhow;
@@ -16,7 +15,6 @@ pub mod downloader;
 pub mod reader;
 pub mod resizer;
 mod sampler;
-mod state;
 pub mod writer;
 
 #[derive(Subcommand, Debug)]
@@ -281,8 +279,6 @@ async fn debug_read(args: DebugReadArgs) -> Result<()> {
 async fn run_downloader(args: Args) -> Result<()> {
     log::info!("Starting downloader with args: {:?}", args);
 
-    let state = Arc::new(State::new(Path::new(&args.state_db_path)).await?);
-
     let reader_options = ReaderOptions {
         root: args.input_root,
         format: args.input_format,
@@ -380,19 +376,18 @@ async fn run_downloader(args: Args) -> Result<()> {
         .enumerate()
         .for_each_concurrent(Some(args.writer_thread_count), |(i, chunk)| {
             let writer = writer.clone();
-            let state = state.clone();
             let shard_id = args.shard_id_start + i;
             async move {
                 log::info!("Processing chunk {} of {} samples", shard_id, chunk.len());
                 let result = match writer.output_format() {
                     OutputFormat::Files => {
                         writer
-                            .write_streaming_samples_to_files(stream::iter(chunk), &state)
+                            .write_streaming_samples_to_files(stream::iter(chunk))
                             .await
                     }
                     OutputFormat::Webdataset => {
                         writer
-                            .write_streaming_samples_to_tar(stream::iter(chunk), shard_id, &state)
+                            .write_streaming_samples_to_tar(stream::iter(chunk), shard_id)
                             .await
                     }
                     OutputFormat::Parquet => {

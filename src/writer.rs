@@ -1,5 +1,4 @@
 use crate::sampler::OutputSample;
-use crate::state::State;
 use anyhow::Result;
 use clap::ValueEnum;
 use futures::{AsyncWriteExt, Stream, StreamExt, TryStreamExt};
@@ -91,36 +90,35 @@ impl Writer {
         self.options.format
     }
 
-    pub async fn write_streaming_samples_to_files<S>(&self, samples: S, state: &State) -> Result<()>
+    pub async fn write_streaming_samples_to_files<S>(&self, samples: S) -> Result<()>
     where
         S: Stream<Item = OutputSample> + Send,
     {
         samples
             .map(Ok)
-            .try_for_each_concurrent(self.options.writer_thread_count, |sample| {
-                let state = state;
-                async move {
-                    match (sample.to_image_file(), sample.to_json_file()) {
-                        (Ok((image_path, image_data)), Ok((json_path, json_data))) => {
-                            let image_write = self.op.write(&image_path, image_data);
-                            let json_write = self.op.write(&json_path, json_data);
+            .try_for_each_concurrent(self.options.writer_thread_count, |sample| async move {
+                match (sample.to_image_file(), sample.to_json_file()) {
+                    (Ok((image_path, image_data)), Ok((json_path, json_data))) => {
+                        let image_write = self.op.write(&image_path, image_data);
+                        let json_write = self.op.write(&json_path, json_data);
 
-                            if let Err(e) = futures::try_join!(image_write, json_write) {
-                                state.set_download_state(&sample.url, false).await?;
-                                log::error!("Failed to write sample files: {}", e);
-                                return Err(e.into());
-                            } else {
-                                state.set_download_state(&sample.url, true).await?;
-                            }
-                        }
-                        _ => {
-                            state.set_download_state(&sample.url, false).await?;
-                            let err_msg = "Failed to prepare sample data for writing.";
-                            log::error!("{}", err_msg);
-                            return Err(anyhow::anyhow!(err_msg));
+                        if let Err(e) = futures::try_join!(image_write, json_write) {
+                            log::error!("Failed to write sample files: {}", e);
+                            return Err(e.into());
+                        } else {
+                            log::info!(
+                                "Successfully wrote sample files: {} and {}",
+                                image_path,
+                                json_path
+                            );
+                            return Ok(());
                         }
                     }
-                    Ok(())
+                    _ => {
+                        let err_msg = "Failed to prepare sample data for writing.";
+                        log::error!("{}", err_msg);
+                        return Err(anyhow::anyhow!(err_msg));
+                    }
                 }
             })
             .await?;
@@ -139,7 +137,6 @@ impl Writer {
         &self,
         mut samples: S,
         shard_id: usize,
-        state: &State,
     ) -> Result<()>
     where
         S: Stream<Item = OutputSample> + Send + Unpin,
@@ -153,7 +150,6 @@ impl Writer {
         let mut tar_writer = async_tar::Builder::new(writer.into_futures_async_write());
 
         while let Some(sample) = samples.next().await {
-            state.set_download_state(&sample.url, false).await?;
             let (json_path, json_data) = sample.to_json_file()?;
             let (image_path, image_data) = sample.to_image_file()?;
             let mut json_header = async_tar::Header::new_gnu();
@@ -172,7 +168,6 @@ impl Writer {
             tar_writer
                 .append_data(&mut image_header, image_path, image_data.as_slice())
                 .await?;
-            state.set_download_state(&sample.url, true).await?;
         }
 
         tar_writer.finish().await?;
