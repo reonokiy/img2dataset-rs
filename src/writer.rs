@@ -6,7 +6,6 @@ use futures::{AsyncWriteExt, Stream, StreamExt, TryStreamExt};
 use opendal::Operator;
 use opendal::services::{Fs, S3};
 use std::str::FromStr;
-use std::sync::atomic::AtomicUsize;
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum OutputFormat {
@@ -46,7 +45,7 @@ pub struct WriterOptions {
     pub s3_access_key: Option<String>,
     pub s3_secret_key: Option<String>,
     pub s3_endpoint: Option<String>,
-    pub writer_concurrent_limit: usize,
+    pub writer_thread_count: usize,
     pub webdataset_shard_bits_num: usize,
     pub webdataset_shard_prefix: String,
 }
@@ -56,8 +55,6 @@ pub struct Writer {
     op: Operator,
     options: WriterOptions,
 }
-
-static WRITER_SHARD_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 impl Writer {
     pub fn new(options: WriterOptions) -> Result<Self> {
@@ -100,7 +97,7 @@ impl Writer {
     {
         samples
             .map(Ok)
-            .try_for_each_concurrent(self.options.writer_concurrent_limit, |sample| {
+            .try_for_each_concurrent(self.options.writer_thread_count, |sample| {
                 let state = state;
                 async move {
                     match (sample.to_image_file(), sample.to_json_file()) {
@@ -130,8 +127,7 @@ impl Writer {
         Ok(())
     }
 
-    fn construct_webdataset_shard_name(&self) -> String {
-        let shard_id = WRITER_SHARD_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    fn construct_webdataset_shard_name(&self, shard_id: usize) -> String {
         format!(
             "{}-{:0>5}.tar",
             self.options.webdataset_shard_prefix,
@@ -142,12 +138,13 @@ impl Writer {
     pub async fn write_streaming_samples_to_tar<S>(
         &self,
         mut samples: S,
+        shard_id: usize,
         state: &State,
     ) -> Result<()>
     where
         S: Stream<Item = OutputSample> + Send + Unpin,
     {
-        let filepath = self.construct_webdataset_shard_name();
+        let filepath = self.construct_webdataset_shard_name(shard_id);
         let writer = self
             .op
             .writer_with(&filepath)

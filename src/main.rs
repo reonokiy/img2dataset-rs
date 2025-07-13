@@ -142,9 +142,9 @@ struct Args {
     reader_caption_column_name: Option<String>,
     #[clap(long, default_value_t = true)]
     reader_save_additional_columns: bool,
-    #[clap(long, default_value_t = 10000)]
-    thread_count: usize,
     #[clap(long, default_value_t = 100)]
+    downloader_thread_count: usize,
+    #[clap(long, default_value_t = 1000)]
     number_of_items_per_shard: usize,
     #[clap(long, default_value_t = 0)]
     shard_id_start: usize,
@@ -160,7 +160,7 @@ struct Args {
     max_items_to_download: u64,
     #[clap(long, default_value_t = 10)]
     timeout: u64,
-    #[clap(long, default_value_t = 3)]
+    #[clap(long, default_value_t = 0)]
     retries: u32,
     #[clap(long)]
     user_agent_token: Option<String>,
@@ -170,8 +170,8 @@ struct Args {
     resume: bool,
     #[clap(long, default_value = ".")]
     state_db_path: PathBuf,
-    #[clap(long, default_value = "100")]
-    writer_concurrent_limit: usize,
+    #[clap(long, default_value = "10")]
+    writer_thread_count: usize,
     #[clap(long, default_value = "10")]
     writer_webdataset_shard_bits_num: usize,
     #[clap(long, default_value = "shard")]
@@ -312,7 +312,7 @@ async fn run_downloader(args: Args) -> Result<()> {
         s3_access_key: args.output_s3_access_key,
         s3_secret_key: args.output_s3_secret_key,
         s3_endpoint: args.output_s3_endpoint,
-        writer_concurrent_limit: args.writer_concurrent_limit,
+        writer_thread_count: args.writer_thread_count,
         webdataset_shard_prefix: args.writer_webdataset_shard_prefix,
         webdataset_shard_bits_num: args.writer_webdataset_shard_bits_num,
     };
@@ -337,7 +337,7 @@ async fn run_downloader(args: Args) -> Result<()> {
         .await
         .map_err(|e| anyhow!("Failed to stream samples: {}", e.to_string()))?;
 
-    let thread_count = args.thread_count;
+    let downloader_thread_count = args.downloader_thread_count;
     let number_of_items_per_shard = args.number_of_items_per_shard;
 
     let download_stream = sample_stream
@@ -346,7 +346,7 @@ async fn run_downloader(args: Args) -> Result<()> {
             let downloader = downloader.clone();
             async move { downloader.download(sample).await }
         })
-        .try_buffer_unordered(thread_count);
+        .try_buffer_unordered(downloader_thread_count);
 
     let processing_stream: Pin<Box<dyn Stream<Item = Result<OutputSample>> + Send>> =
         if args.resize_mode != ResizeMode::No {
@@ -374,26 +374,38 @@ async fn run_downloader(args: Args) -> Result<()> {
         }
     }));
 
-    let mut chunk_stream = final_stream.chunks(number_of_items_per_shard);
+    let chunk_stream = final_stream.chunks(number_of_items_per_shard);
 
-    while let Some(chunk) = chunk_stream.next().await {
-        log::info!("Processing chunk of {} samples", chunk.len());
-        match writer.output_format() {
-            OutputFormat::Files => {
-                writer
-                    .write_streaming_samples_to_files(stream::iter(chunk), &state)
-                    .await?;
+    chunk_stream
+        .enumerate()
+        .for_each_concurrent(Some(args.writer_thread_count), |(i, chunk)| {
+            let writer = writer.clone();
+            let state = state.clone();
+            let shard_id = args.shard_id_start + i;
+            async move {
+                log::info!("Processing chunk {} of {} samples", shard_id, chunk.len());
+                let result = match writer.output_format() {
+                    OutputFormat::Files => {
+                        writer
+                            .write_streaming_samples_to_files(stream::iter(chunk), &state)
+                            .await
+                    }
+                    OutputFormat::Webdataset => {
+                        writer
+                            .write_streaming_samples_to_tar(stream::iter(chunk), shard_id, &state)
+                            .await
+                    }
+                    OutputFormat::Parquet => {
+                        log::warn!("Parquet output format is not yet implemented.");
+                        Ok(())
+                    }
+                };
+                if let Err(e) = result {
+                    log::error!("Failed to write chunk {}: {}", shard_id, e);
+                }
             }
-            OutputFormat::Webdataset => {
-                writer
-                    .write_streaming_samples_to_tar(stream::iter(chunk), &state)
-                    .await?;
-            }
-            OutputFormat::Parquet => {
-                log::warn!("Parquet output format is not yet implemented.");
-            }
-        }
-    }
+        })
+        .await;
 
     Ok(())
 }
