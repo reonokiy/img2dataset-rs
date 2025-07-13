@@ -23,6 +23,7 @@ mod observability;
 pub mod reader;
 pub mod resizer;
 mod sampler;
+mod tui;
 pub mod writer;
 
 #[derive(Subcommand, Debug)]
@@ -174,6 +175,8 @@ struct Args {
     user_agent_token: Option<String>,
     #[clap(long)]
     disallowed_header_directives: Option<Vec<String>>,
+    #[clap(long)]
+    enable_tui: bool,
     #[clap(long, default_value_t = 0)]
     resume_from_shard_number: usize,
     #[clap(long, default_value_t = 0)]
@@ -266,7 +269,7 @@ async fn debug_read(args: DebugReadArgs) -> Result<()> {
         match sample {
             Ok(s) => {
                 counter!("debug_samples_read_total").increment(1);
-                println!("Processing sample {}: {:?}", count, s);
+                log::debug!("Processing sample {}: {:?}", count, s);
             }
             Err(e) => {
                 counter!("debug_samples_error_total").increment(1);
@@ -288,7 +291,27 @@ async fn debug_read(args: DebugReadArgs) -> Result<()> {
 }
 
 async fn main_run(args: Args) -> Result<()> {
-    observability::install_observability()?;
+    // Install observability with log redirection if TUI is enabled
+    observability::install_observability_with_log_redirect(args.enable_tui)?;
+
+    // Setup TUI if enabled
+    let (stats, stats_tx) = if args.enable_tui {
+        let (stats, tx) = tui::create_stats_updater();
+        (Some(stats), Some(tx))
+    } else {
+        (None, None)
+    };
+
+    // Start TUI in background if enabled
+    if let Some(stats_clone) = stats.clone() {
+        let tui_stats = stats_clone.clone();
+        tokio::spawn(async move {
+            if let Err(e) = tui::run_tui(tui_stats).await {
+                // When TUI is running, write critical errors to the log file
+                log::error!("TUI error: {}", e);
+            }
+        });
+    }
 
     // Record application start metrics
     counter!("app_starts_total").increment(1);
@@ -350,6 +373,11 @@ async fn main_run(args: Args) -> Result<()> {
         log::info!("Processing shard {} started", shard_id);
         gauge!("current_shard_id").set(shard_id as f64);
 
+        // Update TUI with current shard
+        if let Some(ref tx) = stats_tx {
+            let _ = tx.send(tui::StatsUpdate::ShardChanged(shard_id as u64));
+        }
+
         let downloader = Downloader::new(
             args.timeout,
             args.user_agent_token.clone(),
@@ -382,15 +410,26 @@ async fn main_run(args: Args) -> Result<()> {
             .await
             .map_err(|e| anyhow!("{}", e))?;
 
+        // Clone stats_tx for use in closures
+        let stats_tx_for_memory = stats_tx.clone();
+        let stats_tx_for_download_start = stats_tx.clone();
+        let stats_tx_for_download_result = stats_tx.clone();
+
         let samples: Pin<Box<dyn Stream<Item = Vec<OutputSample>> + Send>> = Box::pin(
             stream_samples
-                .map(|maybe_sample| {
+                .map(move |maybe_sample| {
                     // Track memory usage with process stats
                     if let Ok(usage) = std::fs::read_to_string("/proc/self/status") {
                         if let Some(line) = usage.lines().find(|l| l.starts_with("VmRSS:")) {
                             if let Some(kb_str) = line.split_whitespace().nth(1) {
                                 if let Ok(kb) = kb_str.parse::<u64>() {
+                                    let mb = (kb as f64) / 1024.0;
                                     metrics::gauge!("memory_usage_bytes").set((kb * 1024) as f64);
+
+                                    // Update TUI with memory usage
+                                    if let Some(ref tx) = stats_tx_for_memory {
+                                        let _ = tx.send(tui::StatsUpdate::MemoryUsage(mb));
+                                    }
                                 }
                             }
                         }
@@ -415,7 +454,14 @@ async fn main_run(args: Args) -> Result<()> {
                 .map(move |sample| {
                     let download_start = Instant::now();
                     let downloader = downloader.clone();
+                    let stats_tx_for_start = stats_tx_for_download_start.clone();
+
                     async move {
+                        // Notify TUI that download started
+                        if let Some(ref tx) = stats_tx_for_start {
+                            let _ = tx.send(tui::StatsUpdate::DownloadStarted);
+                        }
+
                         let result = downloader.download(sample).await;
                         let download_duration = download_start.elapsed();
                         histogram!("download_duration_seconds")
@@ -435,6 +481,11 @@ async fn main_run(args: Args) -> Result<()> {
                                 sample.id,
                                 sample.download_data.len()
                             );
+
+                            // Update TUI
+                            if let Some(ref tx) = stats_tx_for_download_result {
+                                let _ = tx.send(tui::StatsUpdate::DownloadSuccess);
+                            }
                         }
                         SampleStatus::Failure(reason) => {
                             counter!("download_failure_total").increment(1);
@@ -453,6 +504,11 @@ async fn main_run(args: Args) -> Result<()> {
                             }
 
                             log::warn!("Download failed for sample ID {}: {}", sample.id, reason);
+
+                            // Update TUI
+                            if let Some(ref tx) = stats_tx_for_download_result {
+                                let _ = tx.send(tui::StatsUpdate::DownloadFailed(reason.clone()));
+                            }
                         }
                     }
                     sample
