@@ -2050,6 +2050,7 @@ dependencies = [
  "opentelemetry_sdk",
  "parquet",
  "prometheus",
+ "rayon",
  "reqwest",
  "serde",
  "serde_json",

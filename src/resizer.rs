@@ -1,9 +1,12 @@
+use crate::sampler::{BatchSample, OutputSample, SampleStatus};
 use anyhow::{Result, anyhow};
+use arrow::array::BinaryArray;
 use clap::ValueEnum;
-use image::{DynamicImage, GenericImageView, ImageFormat, imageops::FilterType};
+use image::{DynamicImage, GenericImageView, imageops::FilterType};
+use rayon::prelude::*;
 use std::io::Cursor;
 use std::str::FromStr;
-use crate::sampler::{OutputSample, SampleStatus};
+use tokio::task::spawn_blocking;
 
 /// Defines the available resizing modes.
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
@@ -28,71 +31,99 @@ impl FromStr for ResizeMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum ImageFormat {
+    Jpeg,
+}
+
+impl Into<image::ImageFormat> for ImageFormat {
+    fn into(self) -> image::ImageFormat {
+        match self {
+            ImageFormat::Jpeg => image::ImageFormat::Jpeg,
+        }
+    }
+}
+
 /// The `Resizer` is responsible for resizing images.
 #[derive(Clone)]
 pub struct Resizer {
-    image_size: u32,
-    resize_mode: ResizeMode,
-    resize_only_if_bigger: bool,
-    image_format: String,
+    options: ResizerOptions,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResizerOptions {
+    pub resize_mode: ResizeMode,
+    pub target_image_width: u32,
+    pub target_image_height: u32,
+    pub resize_only_if_bigger: bool,
+    pub target_image_format: ImageFormat,
+    pub target_image_quality: u8, // JPEG quality (0-100)
 }
 
 impl Resizer {
-    /// Creates a new `Resizer`.
-    pub fn new(
-        resize_mode: ResizeMode,
-        image_size: u32,
-        resize_only_if_bigger: bool,
-        image_format: &str,
-    ) -> Self {
-        Self {
-            resize_mode,
-            image_size,
-            resize_only_if_bigger,
-            image_format: image_format.to_string(),
-        }
+    pub fn new(options: ResizerOptions) -> Self {
+        Self { options }
     }
 
-    /// Resizes an OutputSample's image data.
-    pub fn resize(&self, mut sample: OutputSample) -> Result<OutputSample> {
-        if sample.status != SampleStatus::Success {
-            return Ok(sample);
-        }
-        
-        match self.resize_image_data(&sample.download_data) {
-            Ok(resized_data) => {
-                sample.download_data = resized_data;
-                Ok(sample)
+    pub fn single_resize(&self, bytes: Vec<u8>) -> Result<Vec<u8>> {
+        let img = image::load_from_memory(&bytes)?;
+
+        let resized_img = match self.options.resize_mode {
+            ResizeMode::No => img,
+            ResizeMode::Border => self.resize_border(img),
+        };
+
+        let mut buf = Cursor::new(Vec::new());
+        match self.options.target_image_format {
+            ImageFormat::Jpeg => {
+                let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(
+                    &mut buf,
+                    self.options.target_image_quality,
+                );
+                encoder.encode_image(&resized_img)?;
             }
-            Err(e) => {
-                sample.status = SampleStatus::Failure(format!("Resize failed: {}", e));
-                Ok(sample)
-            }
         }
+
+        Ok(buf.into_inner())
     }
 
-    /// Resizes an image.
-    pub fn resize_image_data(&self, image_data: &[u8]) -> Result<Vec<u8>> {
-        match self.resize_mode {
-            ResizeMode::No => Ok(image_data.to_vec()),
-            ResizeMode::Border => {
-                let img = image::load_from_memory(image_data)?;
-                let (width, height) = img.dimensions();
+    pub async fn batch_resize(&self, samples: BatchSample) -> Result<BatchSample> {
+        let resizer = self.clone();
+        let handler = spawn_blocking(move || {
+            samples
+                .bytes
+                .par_iter()
+                .enumerate()
+                .map(|(i, data)| -> Result<(usize, Vec<u8>)> {
+                    let bytes = data.value_data();
+                    let img = resizer.single_resize(bytes.to_vec())?;
+                    Ok((i, img))
+                })
+                .collect::<Vec<_>>()
+        });
 
-                if self.resize_only_if_bigger
-                    && width <= self.image_size
-                    && height <= self.image_size
-                {
-                    return Ok(image_data.to_vec());
-                }
-
-                let resized_img = self.resize_border(img);
-
-                let mut buf = Cursor::new(Vec::new());
-                resized_img.write_to(&mut buf, ImageFormat::Jpeg)?;
-                Ok(buf.into_inner())
+        let resized_data = handler.await?;
+        let mut resized_bytes = vec![Vec::new(); samples.len];
+        for result in resized_data.iter() {
+            if let Ok((i, img)) = result {
+                resized_bytes[*i] = img.clone();
             }
         }
+        let bytes = BinaryArray::from_vec(
+            resized_bytes
+                .iter()
+                .map(|b| b.as_slice())
+                .collect::<Vec<_>>(),
+        );
+
+        Ok(BatchSample {
+            len: samples.len,
+            uuid: samples.uuid,
+            url: samples.url,
+            caption: samples.caption,
+            bytes: Some(bytes),
+            additional_columns: samples.additional_columns,
+        })
     }
 
     /// Resizes an image using the "border" mode.
@@ -100,7 +131,10 @@ impl Resizer {
     /// preserving the aspect ratio, and adds a border if necessary.
     fn resize_border(&self, img: DynamicImage) -> DynamicImage {
         let (width, height) = img.dimensions();
-        let (target_width, target_height) = (self.image_size, self.image_size);
+        let (target_width, target_height) = (
+            self.options.target_image_width,
+            self.options.target_image_height,
+        );
 
         if width == target_width && height == target_height {
             return img;

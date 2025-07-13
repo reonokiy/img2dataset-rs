@@ -1,16 +1,26 @@
+use arrow::array::BinaryArray;
 use reqwest::{Client, Response};
-use std::collections::HashSet;
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 
-use crate::sampler::{InputSample, OutputSample, SampleStatus};
+use crate::sampler::{BatchSample, InputSample, OutputSample, SampleStatus};
 
 /// The `Downloader` is responsible for downloading images from URLs.
 #[derive(Clone)]
 pub struct Downloader {
     client: Client,
-    user_agent_token: Option<String>,
-    disallowed_header_directives: HashSet<String>,
-    retries: u32,
+    options: DownloaderOptions,
+}
+
+#[derive(Debug, Clone)]
+pub struct DownloaderOptions {
+    pub thread: usize,
+    pub timeout: u64,
+    pub user_agent: String,
+    pub disallowed_header_directives: Vec<String>,
+    pub retries: u32,
 }
 
 impl Downloader {
@@ -22,42 +32,63 @@ impl Downloader {
     /// * `user_agent_token` - An optional custom User-Agent token.
     /// * `disallowed_header_directives` - Optional list of disallowed X-Robots-Tag directives.
     /// * `retries` - The number of times to retry the download on failure.
-    pub fn new(
-        timeout: u64,
-        user_agent_token: Option<String>,
-        disallowed_header_directives: Option<Vec<String>>,
-        retries: u32,
-    ) -> Self {
-        let user_agent_string =
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36"
-                .to_string()
-                + &user_agent_token
-                    .as_ref()
-                    .map(|token| {
-                        format!(
-                            " (compatible; {}; +https://github.com/reonokiy/img2dataset-rs)",
-                            token
-                        )
-                    })
-                    .unwrap_or_default();
-
+    pub fn new(options: DownloaderOptions) -> Self {
         let client = Client::builder()
-            .user_agent(user_agent_string)
-            .timeout(Duration::from_secs(timeout))
+            .user_agent(options.user_agent.clone())
+            .timeout(Duration::from_secs(options.timeout))
             .build()
-            .unwrap();
+            .expect("Failed to create HTTP client");
 
-        let directives = disallowed_header_directives
-            .unwrap_or_else(|| vec!["noai".to_string(), "noimageai".to_string()])
-            .into_iter()
-            .collect();
+        Self { client, options }
+    }
 
-        Self {
-            client,
-            user_agent_token,
-            disallowed_header_directives: directives,
-            retries,
+    pub async fn download_batch(&self, inputs: BatchSample) -> anyhow::Result<BatchSample> {
+        let mut blobs: Vec<Vec<u8>> = vec![vec![]; inputs.len];
+        let mut set = JoinSet::new();
+        let semaphore = Arc::new(Semaphore::new(self.options.thread));
+
+        for (i, url) in inputs.url.iter().enumerate() {
+            let permit_semaphore = Arc::clone(&semaphore);
+            let downloader = self.clone();
+            let url = url.map(|u| u.to_string());
+            set.spawn(async move {
+                let _permit = permit_semaphore
+                    .acquire()
+                    .await
+                    .expect("Failed to acquire semaphore");
+                match url {
+                    Some(url) => {
+                        let result = downloader.single_download(url).await;
+                        match result {
+                            Ok(data) => (i, Some(data)),
+                            Err(e) => {
+                                log::warn!("{}", e.to_string());
+                                (i, None)
+                            }
+                        }
+                    }
+                    None => (i, None),
+                }
+            });
         }
+
+        while let Some(Ok((i, blob))) = set.join_next().await {
+            match blob {
+                Some(data) => blobs[i] = data,
+                None => (),
+            }
+        }
+
+        let data = BinaryArray::from_vec(blobs.iter().map(|b| b.as_slice()).collect::<Vec<_>>());
+
+        Ok(BatchSample {
+            len: inputs.len,
+            uuid: inputs.uuid,
+            url: inputs.url,
+            caption: inputs.caption,
+            bytes: Some(data),
+            additional_columns: inputs.additional_columns,
+        })
     }
 
     /// Downloads an image from a URL.
@@ -71,7 +102,7 @@ impl Downloader {
     /// An `OutputSample` with either success or failure status.
     pub async fn download(&self, input: InputSample) -> OutputSample {
         let mut last_err = None;
-        for i in 0..=self.retries {
+        for i in 0..=self.options.retries {
             match self.client.get(input.url.clone()).send().await {
                 Ok(response) => {
                     if self.is_disallowed(&response) {
@@ -109,7 +140,12 @@ impl Downloader {
                             };
                         }
                         Err(e) => {
-                            log::warn!("[Try {}] Failed to read bytes from {}: {}", i, input.url, e);
+                            log::warn!(
+                                "[Try {}] Failed to read bytes from {}: {}",
+                                i,
+                                input.url,
+                                e
+                            );
                             last_err = Some(e);
                         }
                     }
@@ -120,7 +156,7 @@ impl Downloader {
                 }
             }
         }
-        
+
         // Return failure sample if all retries failed
         OutputSample {
             id: input.id,
@@ -131,13 +167,38 @@ impl Downloader {
             url: input.url,
             caption: input.caption,
             additional_columns: input.additional_columns,
-            status: SampleStatus::Failure(format!("Download failed after {} retries: {}", self.retries, last_err.map(|e| e.to_string()).unwrap_or_else(|| "Unknown error".to_string()))),
+            status: SampleStatus::Failure(format!(
+                "Download failed after {} retries: {}",
+                self.options.retries,
+                last_err
+                    .map(|e| e.to_string())
+                    .unwrap_or_else(|| "Unknown error".to_string())
+            )),
         }
+    }
+
+    async fn single_download(&self, url: String) -> anyhow::Result<Vec<u8>> {
+        let response = self.client.get(&url).send().await?;
+        if self.is_disallowed(&response) {
+            return Err(anyhow::anyhow!(
+                "Failed to download {}: Disallowed by X-Robots-Tag",
+                url
+            ));
+        }
+        if !response.status().is_success() {
+            return Err(anyhow::anyhow!(
+                "Failed to download {}: Unsuccessful status code {}",
+                url,
+                response.status()
+            ));
+        }
+
+        Ok(response.bytes().await?.to_vec())
     }
 
     /// Checks if the response is disallowed by X-Robots-Tag headers.
     fn is_disallowed(&self, response: &Response) -> bool {
-        if self.disallowed_header_directives.is_empty() {
+        if self.options.disallowed_header_directives.is_empty() {
             return false;
         }
 
@@ -150,10 +211,14 @@ impl Downloader {
                     (None, parts[0])
                 };
 
-                if ua_token.is_none() || ua_token == self.user_agent_token {
+                if ua_token.is_none() || ua_token == Some(self.options.user_agent.clone()) {
                     let directives = directives_str.split(',').map(|d| d.trim().to_lowercase());
                     for directive in directives {
-                        if self.disallowed_header_directives.contains(&directive) {
+                        if self
+                            .options
+                            .disallowed_header_directives
+                            .contains(&directive)
+                        {
                             return true;
                         }
                     }

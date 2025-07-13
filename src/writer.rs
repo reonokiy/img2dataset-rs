@@ -6,7 +6,7 @@ use clap::ValueEnum;
 use futures::{AsyncWriteExt, Stream, StreamExt, TryStreamExt};
 use opendal::Operator;
 use opendal::services::{Fs, S3};
-use parquet::arrow::{ArrowWriter, AsyncArrowWriter};
+use parquet::arrow::AsyncArrowWriter;
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio_util::compat::FuturesAsyncWriteCompatExt;

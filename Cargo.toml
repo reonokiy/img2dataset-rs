@@ -52,3 +52,4 @@ jemallocator = { version = "0.5.4", features = ["stats"] }
 indicatif = "0.17.8"
 arrow-select = "55.2.0"
 uuid = { version = "1.17.0", features = ["v7"] }
+rayon = "1.10.0"
