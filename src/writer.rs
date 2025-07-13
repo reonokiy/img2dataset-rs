@@ -86,6 +86,33 @@ impl Writer {
         Ok(Self { op, options })
     }
 
+    pub async fn write_streaming_samples<S>(&self, samples: S, shard_id: &mut usize) -> Result<()>
+    where
+        S: Stream<Item = OutputSample> + Send + Unpin,
+    {
+        match self.options.format {
+            OutputFormat::Files => self.write_streaming_samples_to_files(samples).await,
+            OutputFormat::Webdataset => {
+                self.write_streaming_samples_to_tar(samples, *shard_id)
+                    .await
+            }
+            OutputFormat::Parquet => {
+                // Implement Parquet writing logic here
+                Err(anyhow::anyhow!(
+                    "Parquet output format is not yet implemented."
+                ))
+            }
+        }
+    }
+
+    fn get_shard_name(&self, shard_id: usize) -> String {
+        format!(
+            "{}-{:0>5}.tar",
+            self.options.webdataset_shard_prefix,
+            shard_id & ((1 << self.options.webdataset_shard_bits_num) - 1)
+        )
+    }
+
     pub fn output_format(&self) -> OutputFormat {
         self.options.format
     }
@@ -125,14 +152,6 @@ impl Writer {
         Ok(())
     }
 
-    fn construct_webdataset_shard_name(&self, shard_id: usize) -> String {
-        format!(
-            "{}-{:0>5}.tar",
-            self.options.webdataset_shard_prefix,
-            shard_id & ((1 << self.options.webdataset_shard_bits_num) - 1)
-        )
-    }
-
     pub async fn write_streaming_samples_to_tar<S>(
         &self,
         mut samples: S,
@@ -141,7 +160,7 @@ impl Writer {
     where
         S: Stream<Item = OutputSample> + Send + Unpin,
     {
-        let filepath = self.construct_webdataset_shard_name(shard_id);
+        let filepath = self.get_shard_name(shard_id);
         let writer = self
             .op
             .writer_with(&filepath)
@@ -157,14 +176,14 @@ impl Writer {
             json_header.set_size(json_data.len() as u64);
             json_header.set_mode(0o644);
             json_header.set_cksum();
-            tar_writer
-                .append_data(&mut json_header, json_path, json_data.as_slice())
-                .await?;
             let mut image_header = async_tar::Header::new_gnu();
             image_header.set_path(image_path.clone())?;
             image_header.set_size(image_data.len() as u64);
             image_header.set_mode(0o644);
             image_header.set_cksum();
+            tar_writer
+                .append_data(&mut json_header, json_path, json_data.as_slice())
+                .await?;
             tar_writer
                 .append_data(&mut image_header, image_path, image_data.as_slice())
                 .await?;

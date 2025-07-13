@@ -5,7 +5,7 @@ use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use std::fs::OpenOptions;
 use std::net::SocketAddr;
 use tracing_subscriber::{
-    Registry, fmt::writer::MakeWriterExt, layer::SubscriberExt, util::SubscriberInitExt,
+    Registry, filter::LevelFilter, layer::SubscriberExt, util::SubscriberInitExt,
 };
 
 lazy_static! {
@@ -32,33 +32,44 @@ pub fn start_metrics_server() -> Result<()> {
 }
 
 pub fn install_observability() -> Result<()> {
-    install_observability_with_log_redirect(false)
+    install_observability_with_config(false, tracing::Level::INFO)
 }
 
 pub fn install_observability_with_log_redirect(redirect_to_file: bool) -> Result<()> {
+    install_observability_with_config(redirect_to_file, tracing::Level::INFO)
+}
+
+pub fn install_observability_with_config(
+    redirect_to_file: bool,
+    log_level: tracing::Level,
+) -> Result<()> {
     setup_metrics_recorder();
 
+    let level_filter = LevelFilter::from_level(log_level);
+
     if redirect_to_file {
-        // When TUI is enabled, redirect logs to a file
+        // When status line is enabled, redirect logs to a file
         let log_file = OpenOptions::new()
             .create(true)
             .append(true)
             .open("img2dataset-rs.log")?;
 
         Registry::default()
+            .with(level_filter)
             .with(
                 tracing_subscriber::fmt::layer()
-                    .with_writer(log_file.with_max_level(tracing::Level::INFO))
+                    .with_writer(log_file)
                     .with_ansi(false), // No ANSI colors in log file
             )
             .init();
 
-        // Also setup a separate writer for errors to stderr when TUI is running
+        // Also setup a separate writer for errors to stderr when status line is running
         // but only for critical errors
         eprintln!("Logs are being written to img2dataset-rs.log");
     } else {
-        // Normal console logging when TUI is not enabled
+        // Normal console logging when status line is not enabled
         Registry::default()
+            .with(level_filter)
             .with(tracing_subscriber::fmt::layer())
             .init();
     }

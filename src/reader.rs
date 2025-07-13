@@ -127,7 +127,7 @@ impl Reader {
                     Ok(file) => {
                         if file.name().ends_with(config.format.extension()) {
                             let path = file.path().to_string();
-                            let reader = op.reader_with(&path.clone()).await?;
+                            let reader = op.reader_with(&path.clone()).chunk(16 * 1024 * 1024).await?;
                             let config_clone = config.clone();
 
                             let stream_result = match config_clone.format {
