@@ -3,11 +3,14 @@ use crate::manager::{PipelineManager, PipelineOptions};
 use crate::observability::{ObservabilityManager, ObservabilityOptions};
 use crate::reader::{InputFormat, Reader, ReaderBackend, ReaderOptions};
 use crate::resizer::{ImageFormat, ResizeMode, ResizerOptions};
-use crate::writer::{OutputBackend, OutputFormat, WriterOptions};
+use crate::sampler::{BatchSample, ShardSample};
+use crate::writer::{OutputBackend, OutputFormat, Writer, WriterOptions};
 use anyhow::Result;
 use anyhow::anyhow;
+use arrow::array::StringArray;
 use clap::{Parser, Subcommand};
 use futures::stream::StreamExt;
+use rayon::option;
 use std::time::Instant;
 
 pub mod downloader;
@@ -42,6 +45,7 @@ struct DebugCommand {
 #[derive(Subcommand, Debug)]
 enum DebugSubcommand {
     Read(Args),
+    Write(Args),
 }
 
 #[derive(Parser, Debug)]
@@ -106,7 +110,7 @@ struct Args {
     writer_root: String,
     #[clap(value_enum, long, default_value_t = OutputBackend::Fs)]
     writer_backend: OutputBackend,
-    #[clap(value_enum, long, default_value_t = OutputFormat::Files)]
+    #[clap(value_enum, long, default_value_t = OutputFormat::Parquet)]
     writer_format: OutputFormat,
     #[clap(long)]
     writer_s3_bucket: Option<String>,
@@ -227,6 +231,44 @@ async fn debug_read(args: Args) -> Result<()> {
     Ok(())
 }
 
+async fn debug_write(args: Args) -> Result<()> {
+    let writer_options = WriterOptions {
+        root: args.writer_root,
+        format: args.writer_format,
+        backend: args.writer_backend,
+        s3_bucket: args.writer_s3_bucket,
+        s3_region: args.writer_s3_region,
+        s3_access_key: args.writer_s3_access_key,
+        s3_secret_key: args.writer_s3_secret_key,
+        s3_endpoint: args.writer_s3_endpoint,
+        b2_bucket: args.writer_b2_bucket,
+        b2_bucket_id: args.writer_b2_bucket_id,
+        b2_application_key_id: args.writer_b2_application_key_id,
+        b2_application_key: args.writer_b2_application_key,
+        shard_prefix: args.writer_shard_prefix,
+    };
+    let writer = Writer::new(writer_options)?;
+
+    let urls1 = vec![
+        "https://example.com/image1.jpg".to_string(),
+        "https://example.com/image2.jpg".to_string(),
+    ];
+    let urls2 = vec![
+        "https://example.com/image3.jpg".to_string(),
+        "https://example.com/image4.jpg".to_string(),
+    ];
+    let batch_sample1 = BatchSample::from_vec(urls1, None);
+    let batch_sample2 = BatchSample::from_vec(urls2, None);
+    let shard = ShardSample {
+        original_filepath: "test_shard.parquet".to_string(),
+        shard_id: uuid::Uuid::now_v7(),
+        samples: vec![batch_sample1, batch_sample2],
+    };
+    writer.shard_write(shard).await?;
+
+    Ok(())
+}
+
 async fn main_run(args: Args) -> Result<()> {
     let observability_options = ObservabilityOptions {
         log_level: args.log_level.into(),
@@ -296,8 +338,8 @@ async fn main_run(args: Args) -> Result<()> {
         max_resizers: args.max_resizers,
         min_writers: args.min_writers,
         max_writers: args.max_writers,
-        min_downloaders: args.downloader_thread_count,
-        max_downloaders: args.downloader_thread_count,
+        min_downloaders: args.minimum_downloaders,
+        max_downloaders: args.minimum_downloaders,
         memory_threshold: args.memory_threshold,
         scale_up_threshold: args.scale_up_threshold,
         scale_down_threshold: args.scale_down_threshold,
@@ -320,6 +362,7 @@ async fn main() -> Result<()> {
         Command::Run(args) => main_run(args).await,
         Command::Debug(debug_command) => match debug_command.command {
             DebugSubcommand::Read(args) => Ok(debug_read(args).await?),
+            DebugSubcommand::Write(args) => Ok(debug_write(args).await?),
         },
     }
 }

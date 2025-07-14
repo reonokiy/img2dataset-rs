@@ -7,6 +7,7 @@ use arrow::array::Array;
 use arrow::array::ArrayRef;
 use arrow::array::BinaryArray;
 use arrow::array::FixedSizeBinaryArray;
+use arrow::array::FixedSizeBinaryBuilder;
 use arrow::array::StringArray;
 use arrow::datatypes::DataType;
 use base64::{Engine as _, engine::general_purpose};
@@ -253,6 +254,29 @@ pub struct BatchSample {
     pub url: StringArray,
     pub bytes: Option<BinaryArray>,
     pub additional_columns: HashMap<String, ArrayRef>,
+}
+
+impl BatchSample {
+    pub fn from_vec(
+        urls: Vec<String>,
+        additional_columns: Option<HashMap<String, ArrayRef>>,
+    ) -> Self {
+        let len = urls.len();
+        let mut uuid_builder = FixedSizeBinaryBuilder::new(16); // 16 bytes for UUID v7
+        for _ in 0..len {
+            uuid_builder.append_value(&uuid::Uuid::now_v7().as_bytes());
+        }
+        let uuid_array = uuid_builder.finish();
+        let url_builder = StringArray::from(urls);
+
+        BatchSample {
+            len,
+            uuid: uuid_array,
+            url: url_builder,
+            bytes: None,
+            additional_columns: additional_columns.unwrap_or_default(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

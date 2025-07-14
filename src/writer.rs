@@ -238,8 +238,8 @@ impl Writer {
     pub async fn write_shard_parquet(&self, samples: ShardSample) -> Result<()> {
         let merged_samples = merge_batch_samples(samples.samples)?;
         let mut schema_vec = vec![
-            Field::new("id", DataType::FixedSizeBinary(16), false),
-            Field::new("url", DataType::Utf8, false),
+            Field::new("_id", DataType::FixedSizeBinary(16), false),
+            Field::new("_url", DataType::Utf8, false),
         ];
         let mut array_vec: Vec<Arc<dyn Array>> =
             vec![Arc::new(merged_samples.uuid), Arc::new(merged_samples.url)];
