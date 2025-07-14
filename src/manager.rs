@@ -33,6 +33,7 @@ use sysinfo::System;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, sleep};
+use tracing::instrument;
 
 use crate::downloader::{Downloader, DownloaderOptions};
 use crate::reader::{Reader, ReaderOptions};
@@ -64,6 +65,7 @@ pub struct PipelineOptions {
 ///
 /// Provides methods to monitor system memory and CPU usage for
 /// dynamic scaling decisions in the pipeline managers.
+#[derive(Debug)]
 struct SystemMonitor {
     system: System,
 }
@@ -78,6 +80,7 @@ impl SystemMonitor {
     /// Gets current memory usage as a ratio (0.0 to 1.0)
     ///
     /// Returns the ratio of used memory to total memory
+    #[instrument(skip(self))]
     fn get_memory_usage(&mut self) -> f32 {
         self.system.refresh_memory();
         let used = self.system.used_memory();
@@ -88,6 +91,7 @@ impl SystemMonitor {
     /// Gets current CPU usage as a ratio (0.0 to 1.0)
     ///
     /// Returns the global CPU usage across all cores
+    #[instrument(skip(self))]
     fn get_cpu_usage(&mut self) -> f32 {
         self.system.refresh_cpu_all();
         self.system.global_cpu_usage() / 100.0
@@ -129,6 +133,7 @@ impl ResizerManager {
     /// - Queue load and scaling needs
     /// - Memory usage for resource management
     /// - Worker health and completion status
+    #[instrument(skip(self))]
     async fn run(&mut self, mut system_monitor: SystemMonitor) {
         tracing::info!(
             "Starting resizer manager with {} initial workers",
@@ -190,6 +195,7 @@ impl ResizerManager {
     }
 
     /// Spawns a new resizer worker
+    #[instrument(skip(self))]
     fn spawn_resizer(&mut self) {
         let id = self.next_worker_id;
         self.next_worker_id += 1;
@@ -208,6 +214,7 @@ impl ResizerManager {
     }
 
     /// Gracefully shuts down one resizer worker
+    #[instrument(skip(self))]
     fn shutdown_one_resizer(&mut self) {
         if let Some((_handle, shutdown_tx)) = self.workers.pop() {
             tracing::info!("Shutting down one resizer worker");
@@ -216,6 +223,7 @@ impl ResizerManager {
     }
 
     /// Shuts down all resizer workers
+    #[instrument(skip(self))]
     async fn shutdown_all(&mut self) {
         tracing::info!("Shutting down all resizer workers");
         while let Some((handle, shutdown_tx)) = self.workers.pop() {
@@ -229,6 +237,7 @@ impl ResizerManager {
 ///
 /// Manages a pool of downloader workers that download images from URLs in parallel.
 /// Automatically scales the number of workers based on queue load and system memory usage.
+#[derive(Debug)]
 struct DownloaderManager {
     workers: Vec<(JoinHandle<()>, oneshot::Sender<()>)>,
     input_rx: Arc<Mutex<mpsc::Receiver<ShardSample>>>,
@@ -239,6 +248,7 @@ struct DownloaderManager {
 }
 
 impl DownloaderManager {
+    #[instrument]
     fn new(
         input_rx: Arc<Mutex<mpsc::Receiver<ShardSample>>>,
         output_tx: mpsc::Sender<ShardSample>,
@@ -260,6 +270,7 @@ impl DownloaderManager {
     /// - Queue load and scaling needs
     /// - Memory usage for resource management
     /// - Worker health and completion status
+    #[instrument(skip(self))]
     async fn run(&mut self, mut system_monitor: SystemMonitor) {
         tracing::info!(
             "Starting downloader manager with {} initial workers",
@@ -321,6 +332,7 @@ impl DownloaderManager {
     }
 
     /// Spawns a new downloader worker
+    #[instrument(skip(self))]
     fn spawn_downloader(&mut self) {
         let id = self.next_worker_id;
         self.next_worker_id += 1;
@@ -339,6 +351,7 @@ impl DownloaderManager {
     }
 
     /// Gracefully shuts down one downloader worker
+    #[instrument(skip(self))]
     fn shutdown_one_downloader(&mut self) {
         if let Some((_handle, shutdown_tx)) = self.workers.pop() {
             tracing::info!("Shutting down one downloader worker");
@@ -347,6 +360,7 @@ impl DownloaderManager {
     }
 
     /// Shuts down all downloader workers
+    #[instrument(skip(self))]
     async fn shutdown_all(&mut self) {
         tracing::info!("Shutting down all downloader workers");
         while let Some((handle, shutdown_tx)) = self.workers.pop() {
@@ -360,6 +374,7 @@ impl DownloaderManager {
 ///
 /// Manages a pool of writer workers that write processed data in parallel.
 /// Automatically scales the number of workers based on queue load and system memory usage.
+#[derive(Debug)]
 struct WriterManager {
     workers: Vec<(JoinHandle<Result<()>>, oneshot::Sender<()>)>,
     input_rx: Arc<Mutex<mpsc::Receiver<ShardSample>>>,
@@ -369,6 +384,7 @@ struct WriterManager {
 }
 
 impl WriterManager {
+    #[instrument]
     fn new(input_rx: Arc<Mutex<mpsc::Receiver<ShardSample>>>, options: PipelineOptions) -> Self {
         Self {
             workers: Vec::new(),
@@ -385,6 +401,7 @@ impl WriterManager {
     /// - Queue load and scaling needs
     /// - Memory usage for resource management
     /// - Worker health and completion status
+    #[instrument(skip(self))]
     async fn run(&mut self, mut system_monitor: SystemMonitor) {
         tracing::info!(
             "Starting writer manager with {} initial workers",
@@ -455,6 +472,7 @@ impl WriterManager {
     }
 
     /// Spawns a new writer worker
+    #[instrument(skip(self))]
     fn spawn_writer(&mut self) {
         let id = self.next_worker_id;
         self.next_worker_id += 1;
@@ -472,6 +490,7 @@ impl WriterManager {
     }
 
     /// Gracefully shuts down one writer worker
+    #[instrument(skip(self))]
     fn shutdown_one_writer(&mut self) {
         if let Some((_handle, shutdown_tx)) = self.workers.pop() {
             tracing::info!("Shutting down one writer worker");
@@ -480,6 +499,7 @@ impl WriterManager {
     }
 
     /// Shuts down all writer workers
+    #[instrument(skip(self))]
     async fn shutdown_all(&mut self) {
         tracing::info!("Shutting down all writer workers");
         while let Some((handle, shutdown_tx)) = self.workers.pop() {
@@ -490,6 +510,7 @@ impl WriterManager {
 }
 
 /// Reader worker thread
+#[instrument]
 async fn reader_worker(options: ReaderOptions, output_tx: mpsc::Sender<ShardSample>) -> Result<()> {
     tracing::info!("Starting reader worker");
     let reader = Reader::new(options)?;
@@ -517,6 +538,7 @@ async fn reader_worker(options: ReaderOptions, output_tx: mpsc::Sender<ShardSamp
 }
 
 /// Resizer worker thread
+#[instrument]
 async fn resizer_worker(
     id: usize,
     options: ResizerOptions,
@@ -563,6 +585,7 @@ async fn resizer_worker(
 }
 
 /// Downloader worker thread
+#[instrument]
 async fn downloader_worker(
     id: usize,
     options: DownloaderOptions,
@@ -603,6 +626,7 @@ async fn downloader_worker(
 }
 
 /// Writer worker thread
+#[instrument]
 async fn writer_worker(
     id: usize,
     options: WriterOptions,
@@ -655,12 +679,13 @@ async fn writer_worker(
 /// - Dynamic scaling based on queue load and system resources
 /// - Graceful shutdown and error handling
 /// - Resource monitoring and adaptive behavior
+#[derive(Debug)]
 pub struct PipelineManager {
     options: PipelineOptions,
 }
 
 impl PipelineManager {
-    /// Creates a new PipelineManager with the given configuration
+    #[instrument]
     pub fn new(options: PipelineOptions) -> Self {
         Self { options }
     }
@@ -672,6 +697,7 @@ impl PipelineManager {
     /// 2. Starts the reader, downloader manager, resizer manager, and writer manager
     /// 3. Monitors all components for completion or errors
     /// 4. Ensures graceful shutdown of all resources
+    #[instrument(skip(self))]
     pub async fn run(&self) -> Result<()> {
         tracing::info!("Starting image processing pipeline");
 

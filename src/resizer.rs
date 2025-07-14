@@ -8,6 +8,7 @@ use rayon::prelude::*;
 use std::io::Cursor;
 use std::str::FromStr;
 use tokio::task::spawn_blocking;
+use tracing::instrument;
 
 /// Defines the available resizing modes.
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
@@ -63,10 +64,12 @@ pub struct ResizerOptions {
 }
 
 impl Resizer {
+    #[instrument]
     pub fn new(options: ResizerOptions) -> Self {
         Self { options }
     }
 
+    #[instrument(skip(self))]
     pub fn single_resize(&self, bytes: Vec<u8>) -> Result<Vec<u8>> {
         if !self.options.reencode && self.options.resize_mode == ResizeMode::No {
             return Ok(bytes);
@@ -93,6 +96,7 @@ impl Resizer {
         Ok(buf.into_inner())
     }
 
+    #[instrument(skip(self))]
     pub async fn batch_resize(&self, samples: BatchSample) -> Result<BatchSample> {
         let resizer = self.clone();
         let handler = spawn_blocking(move || {
@@ -131,6 +135,7 @@ impl Resizer {
         })
     }
 
+    #[instrument(skip(self))]
     pub async fn shard_resize(&self, sample: ShardSample) -> Result<ShardSample> {
         let resize_futures = sample
             .samples
@@ -147,6 +152,7 @@ impl Resizer {
     /// Resizes an image using the "border" mode.
     /// This mode resizes the image to fit within the target dimensions while
     /// preserving the aspect ratio, and adds a border if necessary.
+    #[instrument(skip(self))]
     fn resize_border(&self, img: DynamicImage) -> DynamicImage {
         let (width, height) = img.dimensions();
         let (target_width, target_height) = (
