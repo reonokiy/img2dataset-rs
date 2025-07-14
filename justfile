@@ -68,8 +68,12 @@ release version:
     sed -i.bak "s/^version = .*/version = \"$CARGO_VERSION\"/" Cargo.toml
     rm Cargo.toml.bak
     
+    # Update Cargo.lock to reflect the version change
+    echo "Updating Cargo.lock..."
+    cargo check --quiet
+    
     # Commit version update
-    git add Cargo.toml
+    git add Cargo.toml Cargo.lock
     git commit -m "chore: bump version to {{version}}"
     
     # Create and push tag
