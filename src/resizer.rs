@@ -53,6 +53,7 @@ pub struct Resizer {
 
 #[derive(Debug, Clone)]
 pub struct ResizerOptions {
+    pub reencode: bool,
     pub resize_mode: ResizeMode,
     pub target_image_width: u32,
     pub target_image_height: u32,
@@ -67,6 +68,10 @@ impl Resizer {
     }
 
     pub fn single_resize(&self, bytes: Vec<u8>) -> Result<Vec<u8>> {
+        if !self.options.reencode && self.options.resize_mode == ResizeMode::No {
+            return Ok(bytes);
+        }
+
         let img = image::load_from_memory(&bytes)?;
 
         let resized_img = match self.options.resize_mode {
@@ -86,18 +91,6 @@ impl Resizer {
         }
 
         Ok(buf.into_inner())
-    }
-
-    pub async fn shard_resize(&self, sample: ShardSample) -> Result<ShardSample> {
-        let resize_futures = sample
-            .samples
-            .iter()
-            .map(|sample| self.batch_resize(sample.clone()));
-        let resize_batchs = try_join_all(resize_futures).await?;
-        Ok(ShardSample {
-            shard_id: sample.shard_id,
-            samples: resize_batchs,
-        })
     }
 
     pub async fn batch_resize(&self, samples: BatchSample) -> Result<BatchSample> {
@@ -133,9 +126,21 @@ impl Resizer {
             len: samples.len,
             uuid: samples.uuid,
             url: samples.url,
-            caption: samples.caption,
             bytes: Some(bytes),
             additional_columns: samples.additional_columns,
+        })
+    }
+
+    pub async fn shard_resize(&self, sample: ShardSample) -> Result<ShardSample> {
+        let resize_futures = sample
+            .samples
+            .iter()
+            .map(|sample| self.batch_resize(sample.clone()));
+        let resize_batchs = try_join_all(resize_futures).await?;
+        Ok(ShardSample {
+            original_filepath: sample.original_filepath,
+            shard_id: sample.shard_id,
+            samples: resize_batchs,
         })
     }
 

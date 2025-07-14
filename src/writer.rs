@@ -9,6 +9,7 @@ use parquet::arrow::AsyncArrowWriter;
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio_util::compat::FuturesAsyncWriteCompatExt;
+use tracing::instrument;
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum OutputFormat {
@@ -53,9 +54,7 @@ pub struct WriterOptions {
     pub b2_bucket_id: Option<String>,
     pub b2_application_key_id: Option<String>,
     pub b2_application_key: Option<String>,
-    pub writer_thread_count: usize,
-    pub webdataset_shard_bits_num: usize,
-    pub webdataset_shard_prefix: String,
+    pub shard_prefix: String,
 }
 
 #[derive(Debug, Clone)]
@@ -111,6 +110,7 @@ impl Writer {
         Ok(Self { op, options })
     }
 
+    #[instrument]
     pub async fn shard_write(&self, samples: ShardSample) -> Result<()> {
         match self.options.format {
             OutputFormat::Parquet => self.write_shard_parquet(samples).await,
@@ -146,8 +146,8 @@ impl Writer {
             OutputFormat::Parquet => "parquet",
         };
         format!(
-            "{}-{}.{}",
-            self.options.webdataset_shard_prefix,
+            "{}{}.{}",
+            self.options.shard_prefix,
             shard_id.to_string(),
             extension
         )
@@ -243,10 +243,6 @@ impl Writer {
         ];
         let mut array_vec: Vec<Arc<dyn Array>> =
             vec![Arc::new(merged_samples.uuid), Arc::new(merged_samples.url)];
-        if let Some(caption) = merged_samples.caption {
-            schema_vec.push(Field::new("caption", DataType::Utf8, true));
-            array_vec.push(Arc::new(caption));
-        }
         if let Some(bytes) = merged_samples.bytes {
             schema_vec.push(Field::new("bytes", DataType::Binary, true));
             array_vec.push(Arc::new(bytes));

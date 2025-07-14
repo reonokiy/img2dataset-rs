@@ -1,11 +1,12 @@
 use arrow::array::BinaryArray;
+use futures::stream::{self, StreamExt};
 use reqwest::{Client, Response};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
-use crate::sampler::{BatchSample, InputSample, OutputSample, SampleStatus};
+use crate::sampler::{BatchSample, InputSample, OutputSample, SampleStatus, ShardSample};
 
 /// The `Downloader` is responsible for downloading images from URLs.
 #[derive(Clone)]
@@ -42,7 +43,7 @@ impl Downloader {
         Self { client, options }
     }
 
-    pub async fn download_batch(&self, inputs: BatchSample) -> anyhow::Result<BatchSample> {
+    pub async fn batch_download(&self, inputs: BatchSample) -> BatchSample {
         let mut blobs: Vec<Vec<u8>> = vec![vec![]; inputs.len];
         let mut set = JoinSet::new();
         let semaphore = Arc::new(Semaphore::new(self.options.thread));
@@ -80,15 +81,13 @@ impl Downloader {
         }
 
         let data = BinaryArray::from_vec(blobs.iter().map(|b| b.as_slice()).collect::<Vec<_>>());
-
-        Ok(BatchSample {
+        BatchSample {
             len: inputs.len,
             uuid: inputs.uuid,
             url: inputs.url,
-            caption: inputs.caption,
             bytes: Some(data),
             additional_columns: inputs.additional_columns,
-        })
+        }
     }
 
     /// Downloads an image from a URL.
@@ -226,5 +225,27 @@ impl Downloader {
             }
         }
         false
+    }
+
+    /// Downloads images for all batches in a shard
+    ///
+    /// # Arguments
+    ///
+    /// * `shard` - The shard sample containing batches to download
+    ///
+    /// # Returns
+    ///
+    pub async fn shard_download(&self, shard: ShardSample) -> ShardSample {
+        tracing::info!("Starting download for shard {}", shard.shard_id);
+        let downloaded_bytes = stream::iter(shard.samples.iter())
+            .then(|sample| self.batch_download(sample.clone()))
+            .collect()
+            .await;
+        tracing::info!("Completed download for shard {}", shard.shard_id);
+        ShardSample {
+            original_filepath: shard.original_filepath,
+            shard_id: shard.shard_id,
+            samples: downloaded_bytes,
+        }
     }
 }

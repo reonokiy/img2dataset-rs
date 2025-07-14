@@ -251,13 +251,13 @@ pub struct BatchSample {
     pub len: usize,
     pub uuid: FixedSizeBinaryArray,
     pub url: StringArray,
-    pub caption: Option<StringArray>,
     pub bytes: Option<BinaryArray>,
     pub additional_columns: HashMap<String, ArrayRef>,
 }
 
 #[derive(Debug, Clone)]
 pub struct ShardSample {
+    pub original_filepath: String,
     pub shard_id: uuid::Uuid,
     pub samples: Vec<BatchSample>,
 }
@@ -284,24 +284,6 @@ pub fn merge_batch_samples(batch_samples: Vec<BatchSample>) -> Result<BatchSampl
         .as_any()
         .downcast_ref::<StringArray>()
         .expect("Merged URL should be StringArray");
-    let has_caption = batch_samples.iter().any(|s| s.caption.is_some());
-    let merged_caption = match has_caption {
-        true => {
-            let captions: Vec<&dyn Array> = batch_samples
-                .iter()
-                .filter_map(|s| s.caption.as_ref().map(|c| c as &dyn Array))
-                .collect();
-            let caption_binding = concat(&captions)?;
-            Some(
-                caption_binding
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .expect("Merged caption should be StringArray")
-                    .clone(),
-            )
-        }
-        false => None,
-    };
     let has_bytes = batch_samples.iter().any(|s| s.bytes.is_some());
     let merged_bytes = match has_bytes {
         true => {
@@ -345,7 +327,6 @@ pub fn merge_batch_samples(batch_samples: Vec<BatchSample>) -> Result<BatchSampl
         len: merged_uuid.len(),
         uuid: merged_uuid.clone(),
         url: merged_url.clone(),
-        caption: merged_caption,
         bytes: merged_bytes,
         additional_columns,
     })
@@ -414,7 +395,6 @@ mod tests {
 
     fn create_test_batch_sample(
         urls: Vec<&str>,
-        captions: Option<Vec<&str>>,
         bytes_data: Option<Vec<Vec<u8>>>,
         additional_data: Option<HashMap<String, ArrayRef>>,
     ) -> BatchSample {
@@ -436,15 +416,6 @@ mod tests {
         }
         let url_array = url_builder.finish();
 
-        // Create caption array if provided
-        let caption_array = captions.map(|caps| {
-            let mut caption_builder = StringBuilder::new();
-            for cap in caps {
-                caption_builder.append_value(cap);
-            }
-            caption_builder.finish()
-        });
-
         // Create bytes array if provided
         let bytes_array = bytes_data.map(|bytes| {
             let mut bytes_builder = BinaryBuilder::new();
@@ -458,7 +429,6 @@ mod tests {
             len,
             uuid: uuid_array,
             url: url_array,
-            caption: caption_array,
             bytes: bytes_array,
             additional_columns: additional_data.unwrap_or_default(),
         }
@@ -468,17 +438,11 @@ mod tests {
     fn test_merge_batch_samples_basic() {
         let batch1 = create_test_batch_sample(
             vec!["http://example.com/1", "http://example.com/2"],
-            Some(vec!["caption1", "caption2"]),
             None,
             None,
         );
 
-        let batch2 = create_test_batch_sample(
-            vec!["http://example.com/3"],
-            Some(vec!["caption3"]),
-            None,
-            None,
-        );
+        let batch2 = create_test_batch_sample(vec!["http://example.com/3"], None, None);
 
         let merged = merge_batch_samples(vec![batch1, batch2]).unwrap();
 
@@ -487,12 +451,6 @@ mod tests {
         assert_eq!(merged.url.value(0), "http://example.com/1");
         assert_eq!(merged.url.value(1), "http://example.com/2");
         assert_eq!(merged.url.value(2), "http://example.com/3");
-
-        assert!(merged.caption.is_some());
-        let caption_array = merged.caption.unwrap();
-        assert_eq!(caption_array.value(0), "caption1");
-        assert_eq!(caption_array.value(1), "caption2");
-        assert_eq!(caption_array.value(2), "caption3");
     }
 
     #[test]
@@ -502,13 +460,11 @@ mod tests {
 
         let batch1 = create_test_batch_sample(
             vec!["http://example.com/1", "http://example.com/2"],
-            None,
             Some(bytes1),
             None,
         );
 
-        let batch2 =
-            create_test_batch_sample(vec!["http://example.com/3"], None, Some(bytes2), None);
+        let batch2 = create_test_batch_sample(vec!["http://example.com/3"], Some(bytes2), None);
 
         let merged = merge_batch_samples(vec![batch1, batch2]).unwrap();
 
@@ -536,12 +492,11 @@ mod tests {
         let batch1 = create_test_batch_sample(
             vec!["http://example.com/1", "http://example.com/2"],
             None,
-            None,
             Some(additional1),
         );
 
         let batch2 =
-            create_test_batch_sample(vec!["http://example.com/3"], None, None, Some(additional2));
+            create_test_batch_sample(vec!["http://example.com/3"], None, Some(additional2));
 
         let merged = merge_batch_samples(vec![batch1, batch2]).unwrap();
 
@@ -553,30 +508,6 @@ mod tests {
         assert_eq!(id_array.value(0), 1);
         assert_eq!(id_array.value(1), 2);
         assert_eq!(id_array.value(2), 3);
-    }
-
-    #[test]
-    fn test_merge_batch_samples_mixed_captions() {
-        // First batch has captions, second doesn't
-        let batch1 = create_test_batch_sample(
-            vec!["http://example.com/1"],
-            Some(vec!["caption1"]),
-            None,
-            None,
-        );
-
-        let batch2 = create_test_batch_sample(
-            vec!["http://example.com/2"],
-            None, // No captions
-            None,
-            None,
-        );
-
-        let merged = merge_batch_samples(vec![batch1, batch2]).unwrap();
-
-        assert_eq!(merged.len, 2);
-        // Should have captions because at least one batch has them
-        assert!(merged.caption.is_some());
     }
 
     #[test]
@@ -595,7 +526,6 @@ mod tests {
     fn test_merge_batch_samples_single_batch() {
         let batch = create_test_batch_sample(
             vec!["http://example.com/1", "http://example.com/2"],
-            Some(vec!["caption1", "caption2"]),
             None,
             None,
         );
@@ -605,6 +535,5 @@ mod tests {
 
         assert_eq!(merged.len, original_len);
         assert_eq!(merged.url.len(), 2);
-        assert!(merged.caption.is_some());
     }
 }

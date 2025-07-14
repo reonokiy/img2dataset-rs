@@ -1,3 +1,4 @@
+use crate::downloader::DownloaderOptions;
 use crate::manager::{PipelineManager, PipelineOptions};
 use crate::observability::{ObservabilityManager, ObservabilityOptions};
 use crate::reader::{InputFormat, Reader, ReaderBackend, ReaderOptions};
@@ -7,7 +8,6 @@ use anyhow::Result;
 use anyhow::anyhow;
 use clap::{Parser, Subcommand};
 use futures::stream::StreamExt;
-use std::path::PathBuf;
 use std::time::Instant;
 
 pub mod downloader;
@@ -47,119 +47,121 @@ enum DebugSubcommand {
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
 struct Args {
+    // Reader options
     #[clap(long, default_value = "url")]
     reader_url_column_name: String,
-    #[clap(long)]
-    reader_caption_column_name: Option<String>,
     #[clap(long, default_value_t = true)]
     reader_save_additional_columns: bool,
-    #[clap(long, default_value_t = 100)]
-    downloader_thread_count: usize,
-    #[clap(long, default_value_t = 1000)]
-    number_of_items_per_shard: usize,
-    #[clap(long, default_value_t = 0)]
-    shard_id_start: usize,
-    #[clap(value_enum, long, default_value_t = ImageFormat::Jpeg)]
-    image_format: ImageFormat,
-    #[clap(value_enum, long, default_value_t = ResizeMode::Border)]
-    resize_mode: ResizeMode,
-    #[clap(long, default_value_t = 256)]
-    image_size: u32,
     #[clap(long)]
-    resize_only_if_bigger: bool,
-    #[clap(long, default_value_t = u64::MAX)]
-    max_items_to_download: u64,
-    #[clap(long, default_value_t = 60)]
-    timeout: u64,
-    #[clap(long, default_value_t = 0)]
-    retries: u32,
-    #[clap(long)]
-    user_agent_token: Option<String>,
-    #[clap(long)]
-    disallowed_header_directives: Option<Vec<String>>,
-    #[clap(long, default_value_t = 0)]
-    resume_from_shard_number: usize,
-    #[clap(long, default_value_t = 0)]
-    resume_from_sample_number: usize,
-    #[clap(long, default_value = ".")]
-    state_db_path: PathBuf,
-    #[clap(long, default_value = "10")]
-    writer_thread_count: usize,
-    #[clap(long, default_value = "10")]
-    writer_webdataset_shard_bits_num: usize,
-    #[clap(long, default_value = "shard")]
-    writer_webdataset_shard_prefix: String,
-    #[clap(long, default_value = ".")]
-    input_root: String,
+    reader_root: String,
     #[clap(value_enum, long, default_value_t = ReaderBackend::Fs)]
-    input_backend: ReaderBackend,
+    reader_backend: ReaderBackend,
     #[clap(value_enum, long, default_value_t = InputFormat::Parquet)]
-    input_format: InputFormat,
-
-    // Input Backend Hugging Face options
+    reader_format: InputFormat,
     #[clap(long)]
-    input_hf_access_token: Option<String>,
+    reader_s3_bucket: Option<String>,
     #[clap(long)]
-    input_hf_dataset_repo_id: Option<String>,
+    reader_s3_region: Option<String>,
     #[clap(long)]
-    input_hf_revision: Option<String>,
-
-    // Input Backend S3 options
+    reader_s3_access_key: Option<String>,
     #[clap(long)]
-    input_s3_bucket: Option<String>,
+    reader_s3_secret_key: Option<String>,
     #[clap(long)]
-    input_s3_region: Option<String>,
+    reader_s3_endpoint: Option<String>,
     #[clap(long)]
-    input_s3_access_key: Option<String>,
+    reader_hf_access_token: Option<String>,
     #[clap(long)]
-    input_s3_secret_key: Option<String>,
+    reader_hf_dataset_repo_id: Option<String>,
     #[clap(long)]
-    input_s3_endpoint: Option<String>,
-
-    // Output options
-    #[clap(long, default_value = ".")]
-    output_root: String,
-    #[clap(value_enum, long, default_value_t = OutputBackend::Fs)]
-    output_backend: OutputBackend,
-    #[clap(value_enum, long, default_value_t = OutputFormat::Files)]
-    output_format: OutputFormat,
-    #[clap(long)]
-    output_s3_bucket: Option<String>,
-    #[clap(long)]
-    output_s3_region: Option<String>,
-    #[clap(long)]
-    output_s3_access_key: Option<String>,
-    #[clap(long)]
-    output_s3_secret_key: Option<String>,
-    #[clap(long)]
-    output_s3_endpoint: Option<String>,
-    #[clap(long)]
-    output_b2_bucket: Option<String>,
-    #[clap(long)]
-    output_b2_bucket_id: Option<String>,
-    #[clap(long)]
-    output_b2_application_key_id: Option<String>,
-    #[clap(long)]
-    output_b2_application_key: Option<String>,
-
-    // Pipeline options
+    reader_hf_revision: Option<String>,
     #[clap(long, default_value_t = 1024)]
-    buffer_size: usize,
+    reader_batch_size: usize,
+    #[clap(long, default_value_t = 8)]
+    reader_batch_per_shard: usize,
+    #[clap(long, default_value_t = 16 * 1024 * 1024)]
+    reader_opendal_buffer_size: usize,
+
+    // Resizer options
+    #[clap(long, default_value_t = false)]
+    reencode: bool,
+    #[clap(value_enum, long, default_value_t = ImageFormat::Jpeg)]
+    reencode_image_format: ImageFormat,
+    #[clap(long, default_value_t = 95)]
+    reencode_image_quality: u8,
+    #[clap(value_enum, long, default_value_t = ResizeMode::No)]
+    resize_mode: ResizeMode,
+    #[clap(long, default_value_t = 512)]
+    resize_image_height: u32,
+    #[clap(long, default_value_t = 512)]
+    resize_image_width: u32,
+    #[clap(long, default_value_t = false)]
+    resize_only_if_bigger: bool,
     #[clap(long, default_value_t = 1)]
     min_resizers: usize,
     #[clap(long, default_value_t = 10)]
     max_resizers: usize,
+
+    // Writer options
+    #[clap(long)]
+    writer_root: String,
+    #[clap(value_enum, long, default_value_t = OutputBackend::Fs)]
+    writer_backend: OutputBackend,
+    #[clap(value_enum, long, default_value_t = OutputFormat::Files)]
+    writer_format: OutputFormat,
+    #[clap(long)]
+    writer_s3_bucket: Option<String>,
+    #[clap(long)]
+    writer_s3_region: Option<String>,
+    #[clap(long)]
+    writer_s3_access_key: Option<String>,
+    #[clap(long)]
+    writer_s3_secret_key: Option<String>,
+    #[clap(long)]
+    writer_s3_endpoint: Option<String>,
+    #[clap(long)]
+    writer_b2_bucket: Option<String>,
+    #[clap(long)]
+    writer_b2_bucket_id: Option<String>,
+    #[clap(long)]
+    writer_b2_application_key_id: Option<String>,
+    #[clap(long)]
+    writer_b2_application_key: Option<String>,
+    #[clap(long, default_value = "")]
+    writer_shard_prefix: String,
     #[clap(long, default_value_t = 1)]
     min_writers: usize,
     #[clap(long, default_value_t = 10)]
     max_writers: usize,
+
+    // Downloader options
+    #[clap(long, default_values_t = vec!["noai".to_string(), "noimageai".to_string(), "noindex".to_string(), "noimageindex".to_string()])]
+    disallowed_header_directives: Vec<String>,
+    #[clap(long, default_value_t = 64)]
+    downloader_thread_count: usize,
+    #[clap(long, default_value_t = 10)]
+    timeout: u64,
+    #[clap(long, default_value_t = 1)]
+    retries: u32,
+    #[clap(
+        long,
+        default_value = "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:72.0) Gecko/20100101 Firefox/72.0 (compatible; +https://github.com/reonokiy/img2dataset-rs)"
+    )]
+    user_agent: String,
+    #[clap(long, default_value_t = 1)]
+    minimum_downloaders: usize,
+    #[clap(long, default_value_t = 10)]
+    maximum_downloaders: usize,
+
+    // Pipeline options
+    #[clap(long, default_value_t = 1024)]
+    buffer_size: usize,
     #[clap(long, default_value_t = 0.9)]
     memory_threshold: f32,
-    #[clap(long, default_value_t = 0.2)]
-    scale_up_threshold: f32,
     #[clap(long, default_value_t = 0.8)]
+    scale_up_threshold: f32,
+    #[clap(long, default_value_t = 0.2)]
     scale_down_threshold: f32,
-    #[clap(long, default_value_t = 5000)]
+    #[clap(long, default_value_t = 1000)]
     manager_check_interval_ms: u64,
 
     // Observability options
@@ -175,27 +177,28 @@ async fn debug_read(args: Args) -> Result<()> {
 
     tracing::info!("Starting debug read mode");
     let reader_options = ReaderOptions {
-        format: args.input_format,
-        backend: args.input_backend,
-        root: args.input_root,
-        huggingface_token: args.input_hf_access_token,
-        huggingface_repo_id: args.input_hf_dataset_repo_id,
-        huggingface_revision: args.input_hf_revision,
-        s3_bucket: args.input_s3_bucket,
-        s3_region: args.input_s3_region,
-        s3_access_key: args.input_s3_access_key,
-        s3_secret_key: args.input_s3_secret_key,
-        s3_endpoint: args.input_s3_endpoint,
-        input_url_column_name: args.reader_url_column_name,
-        input_caption_column_name: args.reader_caption_column_name,
+        format: args.reader_format,
+        backend: args.reader_backend,
+        root: args.reader_root,
+        huggingface_token: args.reader_hf_access_token,
+        huggingface_repo_id: args.reader_hf_dataset_repo_id,
+        huggingface_revision: args.reader_hf_revision,
+        s3_bucket: args.reader_s3_bucket,
+        s3_region: args.reader_s3_region,
+        s3_access_key: args.reader_s3_access_key,
+        s3_secret_key: args.reader_s3_secret_key,
+        s3_endpoint: args.reader_s3_endpoint,
+        url_column_name: args.reader_url_column_name,
         save_additional_columns: args.reader_save_additional_columns,
-        batch_per_shard: args.number_of_items_per_shard,
+        batch_size: args.reader_batch_size,
+        batch_per_shard: args.reader_batch_per_shard,
+        opendal_buffer_size: args.reader_opendal_buffer_size,
     };
 
     let reader = Reader::new(reader_options)
         .map_err(|e| anyhow!("Failed to create reader: {}", e.to_string()))?;
     let mut stream = reader
-        .stream_samples()
+        .shard_read()
         .await
         .map_err(|e| anyhow!("Failed to stream samples: {}", e.to_string()))?;
 
@@ -230,67 +233,62 @@ async fn main_run(args: Args) -> Result<()> {
     };
     let mut observability_manager = ObservabilityManager::new(observability_options);
 
-    tracing::info!(
-        "Starting img2dataset-rs with {} downloader threads, {} items per shard",
-        args.downloader_thread_count,
-        args.number_of_items_per_shard
-    );
-
-    if args.resume_from_shard_number > 0 || args.resume_from_sample_number > 0 {
-        tracing::info!(
-            "Resume mode enabled: starting from shard {}, sample {}",
-            args.resume_from_shard_number,
-            args.resume_from_sample_number
-        );
-    }
-
     let reader_options = ReaderOptions {
-        input_url_column_name: args.reader_url_column_name,
-        input_caption_column_name: args.reader_caption_column_name,
-        format: args.input_format,
-        backend: args.input_backend,
-        root: args.input_root,
-        s3_bucket: args.input_s3_bucket,
-        s3_region: args.input_s3_region,
-        s3_access_key: args.input_s3_access_key,
-        s3_secret_key: args.input_s3_secret_key,
-        s3_endpoint: args.input_s3_endpoint,
-        huggingface_token: args.input_hf_access_token,
-        huggingface_repo_id: args.input_hf_dataset_repo_id,
-        huggingface_revision: args.input_hf_revision,
+        url_column_name: args.reader_url_column_name,
+        format: args.reader_format,
+        backend: args.reader_backend,
+        root: args.reader_root,
+        s3_bucket: args.reader_s3_bucket,
+        s3_region: args.reader_s3_region,
+        s3_access_key: args.reader_s3_access_key,
+        s3_secret_key: args.reader_s3_secret_key,
+        s3_endpoint: args.reader_s3_endpoint,
+        huggingface_token: args.reader_hf_access_token,
+        huggingface_repo_id: args.reader_hf_dataset_repo_id,
+        huggingface_revision: args.reader_hf_revision,
         save_additional_columns: args.reader_save_additional_columns,
-        batch_per_shard: args.number_of_items_per_shard,
+        batch_size: args.reader_batch_size,
+        batch_per_shard: args.reader_batch_per_shard,
+        opendal_buffer_size: args.reader_opendal_buffer_size,
+    };
+
+    let downloader_options = DownloaderOptions {
+        thread: args.downloader_thread_count,
+        timeout: args.timeout,
+        retries: args.retries,
+        user_agent: args.user_agent,
+        disallowed_header_directives: args.disallowed_header_directives,
     };
 
     let resizer_options = ResizerOptions {
+        reencode: args.reencode,
         resize_mode: args.resize_mode,
-        target_image_width: args.image_size,
-        target_image_height: args.image_size,
+        target_image_width: args.resize_image_height,
+        target_image_height: args.resize_image_height,
         resize_only_if_bigger: args.resize_only_if_bigger,
-        target_image_format: args.image_format,
+        target_image_format: args.reencode_image_format,
         target_image_quality: 95, // High quality JPEG
     };
 
     let writer_options = WriterOptions {
-        root: args.output_root,
-        format: args.output_format,
-        backend: args.output_backend,
-        s3_bucket: args.output_s3_bucket,
-        s3_region: args.output_s3_region,
-        s3_access_key: args.output_s3_access_key,
-        s3_secret_key: args.output_s3_secret_key,
-        s3_endpoint: args.output_s3_endpoint,
-        b2_bucket: args.output_b2_bucket,
-        b2_bucket_id: args.output_b2_bucket_id,
-        b2_application_key_id: args.output_b2_application_key_id,
-        b2_application_key: args.output_b2_application_key,
-        writer_thread_count: args.writer_thread_count,
-        webdataset_shard_bits_num: args.writer_webdataset_shard_bits_num,
-        webdataset_shard_prefix: args.writer_webdataset_shard_prefix,
+        root: args.writer_root,
+        format: args.writer_format,
+        backend: args.writer_backend,
+        s3_bucket: args.writer_s3_bucket,
+        s3_region: args.writer_s3_region,
+        s3_access_key: args.writer_s3_access_key,
+        s3_secret_key: args.writer_s3_secret_key,
+        s3_endpoint: args.writer_s3_endpoint,
+        b2_bucket: args.writer_b2_bucket,
+        b2_bucket_id: args.writer_b2_bucket_id,
+        b2_application_key_id: args.writer_b2_application_key_id,
+        b2_application_key: args.writer_b2_application_key,
+        shard_prefix: args.writer_shard_prefix,
     };
 
     let pipeline_options = PipelineOptions {
         reader_options,
+        downloader_options,
         resizer_options,
         writer_options,
         buffer_size: args.buffer_size,
@@ -298,6 +296,8 @@ async fn main_run(args: Args) -> Result<()> {
         max_resizers: args.max_resizers,
         min_writers: args.min_writers,
         max_writers: args.max_writers,
+        min_downloaders: args.downloader_thread_count,
+        max_downloaders: args.downloader_thread_count,
         memory_threshold: args.memory_threshold,
         scale_up_threshold: args.scale_up_threshold,
         scale_down_threshold: args.scale_down_threshold,
