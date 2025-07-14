@@ -1,4 +1,4 @@
-use crate::sampler::BatchSample;
+use crate::sampler::{BatchSample, ShardSample};
 use crate::sampler::{InputSample, InputSampleColumnData, get_ith_element_from_array};
 use anyhow::anyhow;
 use arrow::array::FixedSizeBinaryBuilder;
@@ -40,6 +40,7 @@ pub struct ReaderOptions {
     pub input_url_column_name: String,
     pub input_caption_column_name: Option<String>,
     pub save_additional_columns: bool,
+    pub batch_per_shard: usize,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -68,7 +69,7 @@ type SampleStream =
     Pin<Box<dyn Stream<Item = Result<InputSample, Box<dyn Error + Send + Sync>>> + Send>>;
 
 impl Reader {
-    pub fn new(options: ReaderOptions) -> Result<Self, Box<dyn Error>> {
+    pub fn new(options: ReaderOptions) -> anyhow::Result<Self> {
         let op = match options.backend {
             ReaderBackend::Fs => {
                 let builder = Fs::default().root(&options.root);
@@ -116,6 +117,40 @@ impl Reader {
         })
     }
 
+    pub async fn batch_read(
+        &self,
+    ) -> anyhow::Result<impl Stream<Item = anyhow::Result<ShardSample>>> {
+        let file_lister = self.op.lister_with("").recursive(true).await?;
+        let config = self.options.clone();
+        let op = self.op.clone();
+
+        let stream_of_streams = stream! {
+            let mut file_lister = file_lister;
+            while let Some(Ok(file)) = file_lister.next().await {
+                if file.name().ends_with(config.format.extension()) {
+                    let uuid = uuid::Uuid::now_v7();
+                    let path = file.path().to_string();
+                    let reader = op.reader_with(&path.clone()).chunk(16 * 1024 * 1024).await?;
+                    match config.format {
+                        InputFormat::Txt => {
+                            // TODO: Implement batch reading for TXT
+                            yield Err(anyhow!("Batch reading for TXT not implemented"));
+                        }
+                        InputFormat::Csv => {
+                            // TODO: Implement batch reading for CSV
+                            yield Err(anyhow!("Batch reading for CSV not implemented"));
+                        }
+                        InputFormat::Parquet => {
+                            yield read_batch_parquet(uuid, reader, config.clone()).await;
+                        }
+                    }
+                }
+            }
+        };
+
+        Ok(stream_of_streams.try_flatten())
+    }
+
     pub async fn stream_samples(&self) -> Result<SampleStream, Box<dyn Error + Send + Sync>> {
         let file_lister = self.op.lister_with("").recursive(true).await?;
         let config = self.options.clone();
@@ -124,7 +159,7 @@ impl Reader {
         let stream_of_streams = stream! {
             let mut file_lister = file_lister;
             while let Some(file) = file_lister.next().await {
-                log::debug!("Listing file: {:?}", file);
+                tracing::debug!("Listing file: {:?}", file);
                 match file {
                     Ok(file) => {
                         if file.name().ends_with(config.format.extension()) {
@@ -162,7 +197,7 @@ impl Reader {
                         }
                     }
                     Err(e) => {
-                        log::error!("Error listing file: {}", e);
+                        tracing::error!("Error listing file: {}", e);
                         yield Err(e.into());
                     }
                 }
@@ -212,7 +247,7 @@ async fn read_txt_stream(
     let stream = stream! {
         while let Some(new_line_result) = lines.next_line().await.transpose() {
             let new_line = new_line_result.unwrap();
-            log::debug!("Reading line: {:?}", new_line);
+            tracing::debug!("Reading line: {:?}", new_line);
             // assuming each line is a URL
             if new_line.trim().is_empty() {
                 continue; // skip empty lines
@@ -479,9 +514,10 @@ async fn read_parquet_stream(
 }
 
 async fn read_batch_parquet(
+    shard_id: uuid::Uuid,
     reader: opendal::Reader,
     options: ReaderOptions,
-) -> anyhow::Result<impl Stream<Item = anyhow::Result<BatchSample>> + Send> {
+) -> anyhow::Result<impl Stream<Item = anyhow::Result<ShardSample>>> {
     let builder =
         ParquetRecordBatchStreamBuilder::new(reader.into_futures_async_read(..).await?.compat())
             .await
@@ -508,6 +544,10 @@ async fn read_batch_parquet(
     };
 
     let stream = stream! {
+        let mut shard_sample = ShardSample {
+            shard_id,
+            samples: Vec::new(),
+        };
         while let Some(Ok(batch)) = record_batch_reader.next().await {
             let mut uuid_builder = FixedSizeBinaryBuilder::new(16); // 16 bytes for UUID v7
             for _ in 0..batch.num_rows() {
@@ -547,14 +587,22 @@ async fn read_batch_parquet(
                 );
             }
 
-            yield Ok(BatchSample {
-                len: batch.num_rows(),
-                uuid: uuid.clone(),
-                url: url.clone(),
-                caption: caption.map(|c| c.clone()),
-                bytes: None,
-                additional_columns: additional_columns,
-            })
+            if shard_sample.samples.len() >= options.batch_per_shard {
+                yield Ok(shard_sample.clone());
+                shard_sample.samples.clear();
+            } else {
+                shard_sample.samples.push(BatchSample {
+                    len: batch.num_rows(),
+                    uuid: uuid.clone(),
+                    url: url.clone(),
+                    caption: caption.map(|c| c.clone()),
+                    bytes: None,
+                    additional_columns: additional_columns,
+                });
+            }
+        }
+        if !shard_sample.samples.is_empty() {
+            yield Ok(shard_sample);
         }
     };
 

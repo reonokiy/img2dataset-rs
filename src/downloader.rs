@@ -62,7 +62,7 @@ impl Downloader {
                         match result {
                             Ok(data) => (i, Some(data)),
                             Err(e) => {
-                                log::warn!("{}", e.to_string());
+                                tracing::warn!("{}", e.to_string());
                                 (i, None)
                             }
                         }
@@ -126,7 +126,7 @@ impl Downloader {
                     match response.bytes().await {
                         Ok(data) => {
                             let data_vec = data.to_vec();
-                            log::info!("Successfully downloaded {}", input.url);
+                            tracing::info!("Successfully downloaded {}", input.url);
                             return OutputSample {
                                 id: input.id,
                                 original_filepath: input.original_filepath,
@@ -140,7 +140,7 @@ impl Downloader {
                             };
                         }
                         Err(e) => {
-                            log::warn!(
+                            tracing::warn!(
                                 "[Try {}] Failed to read bytes from {}: {}",
                                 i,
                                 input.url,
@@ -151,7 +151,7 @@ impl Downloader {
                     }
                 }
                 Err(e) => {
-                    log::warn!("[Try {}] Failed to download {}: {}", i, input.url, e);
+                    tracing::warn!("[Try {}] Failed to download {}: {}", i, input.url, e);
                     last_err = Some(e);
                 }
             }

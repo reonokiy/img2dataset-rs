@@ -1,9 +1,8 @@
-use crate::sampler::{BatchSample, OutputSample, merge_batch_samples};
+use crate::sampler::{ShardSample, merge_batch_samples};
 use anyhow::Result;
 use arrow::array::{Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema};
 use clap::ValueEnum;
-use futures::{AsyncWriteExt, Stream, StreamExt, TryStreamExt};
 use opendal::Operator;
 use opendal::services::{Fs, S3};
 use parquet::arrow::AsyncArrowWriter;
@@ -112,30 +111,45 @@ impl Writer {
         Ok(Self { op, options })
     }
 
-    pub async fn write_streaming_samples<S>(&self, samples: S, shard_id: &mut usize) -> Result<()>
-    where
-        S: Stream<Item = OutputSample> + Send + Unpin,
-    {
+    pub async fn shard_write(&self, samples: ShardSample) -> Result<()> {
         match self.options.format {
-            OutputFormat::Files => self.write_streaming_samples_to_files(samples).await,
-            OutputFormat::Webdataset => {
-                self.write_streaming_samples_to_tar(samples, *shard_id)
-                    .await
-            }
-            OutputFormat::Parquet => {
-                // Implement Parquet writing logic here
-                Err(anyhow::anyhow!(
-                    "Parquet output format is not yet implemented."
-                ))
-            }
+            OutputFormat::Parquet => self.write_shard_parquet(samples).await,
+            _ => Err(anyhow::anyhow!(
+                "Unsupported output format for shard writing."
+            )),
         }
     }
 
-    fn get_shard_name(&self, shard_id: usize) -> String {
+    // pub async fn write_streaming_samples<S>(&self, samples: S, shard_id: &mut usize) -> Result<()>
+    // where
+    //     S: Stream<Item = OutputSample> + Send + Unpin,
+    // {
+    //     match self.options.format {
+    //         OutputFormat::Files => self.write_streaming_samples_to_files(samples).await,
+    //         OutputFormat::Webdataset => {
+    //             self.write_streaming_samples_to_tar(samples, *shard_id)
+    //                 .await
+    //         }
+    //         OutputFormat::Parquet => {
+    //             // Implement Parquet writing logic here
+    //             Err(anyhow::anyhow!(
+    //                 "Parquet output format is not yet implemented."
+    //             ))
+    //         }
+    //     }
+    // }
+
+    fn get_shard_name(&self, shard_id: uuid::Uuid) -> String {
+        let extension = match self.options.format {
+            OutputFormat::Files => "jsonl",
+            OutputFormat::Webdataset => "tar",
+            OutputFormat::Parquet => "parquet",
+        };
         format!(
-            "{}-{:0>5}.tar",
+            "{}-{}.{}",
             self.options.webdataset_shard_prefix,
-            shard_id & ((1 << self.options.webdataset_shard_bits_num) - 1)
+            shard_id.to_string(),
+            extension
         )
     }
 
@@ -143,92 +157,88 @@ impl Writer {
         self.options.format
     }
 
-    pub async fn write_streaming_samples_to_files<S>(&self, samples: S) -> Result<()>
-    where
-        S: Stream<Item = OutputSample> + Send,
-    {
-        samples
-            .map(Ok)
-            .try_for_each_concurrent(self.options.writer_thread_count, |sample| async move {
-                match (sample.to_image_file(), sample.to_json_file()) {
-                    (Ok((image_path, image_data)), Ok((json_path, json_data))) => {
-                        let image_write = self.op.write(&image_path, image_data);
-                        let json_write = self.op.write(&json_path, json_data);
+    // pub async fn write_streaming_samples_to_files<S>(&self, samples: S) -> Result<()>
+    // where
+    //     S: Stream<Item = OutputSample> + Send,
+    // {
+    //     samples
+    //         .map(Ok)
+    //         .try_for_each_concurrent(self.options.writer_thread_count, |sample| async move {
+    //             match (sample.to_image_file(), sample.to_json_file()) {
+    //                 (Ok((image_path, image_data)), Ok((json_path, json_data))) => {
+    //                     let image_write = self.op.write(&image_path, image_data);
+    //                     let json_write = self.op.write(&json_path, json_data);
 
-                        if let Err(e) = futures::try_join!(image_write, json_write) {
-                            log::error!("Failed to write sample files: {}", e);
-                            return Err(e.into());
-                        } else {
-                            log::info!(
-                                "Successfully wrote sample files: {} and {}",
-                                image_path,
-                                json_path
-                            );
-                            return Ok(());
-                        }
-                    }
-                    _ => {
-                        let err_msg = "Failed to prepare sample data for writing.";
-                        log::error!("{}", err_msg);
-                        return Err(anyhow::anyhow!(err_msg));
-                    }
-                }
-            })
-            .await?;
-        Ok(())
-    }
+    //                     if let Err(e) = futures::try_join!(image_write, json_write) {
+    //                         tracing::error!("Failed to write sample files: {}", e);
+    //                         return Err(e.into());
+    //                     } else {
+    //                         tracing::info!(
+    //                             "Successfully wrote sample files: {} and {}",
+    //                             image_path,
+    //                             json_path
+    //                         );
+    //                         return Ok(());
+    //                     }
+    //                 }
+    //                 _ => {
+    //                     let err_msg = "Failed to prepare sample data for writing.";
+    //                     tracing::error!("{}", err_msg);
+    //                     return Err(anyhow::anyhow!(err_msg));
+    //                 }
+    //             }
+    //         })
+    //         .await?;
+    //     Ok(())
+    // }
 
-    pub async fn write_streaming_samples_to_tar<S>(
-        &self,
-        mut samples: S,
-        shard_id: usize,
-    ) -> Result<()>
-    where
-        S: Stream<Item = OutputSample> + Send + Unpin,
-    {
-        let filepath = self.get_shard_name(shard_id);
-        let writer = self
-            .op
-            .writer_with(&filepath)
-            .chunk(16 * 1024 * 1024) // 16 MB chunk size
-            .await?;
-        let mut tar_writer = async_tar::Builder::new(writer.into_futures_async_write());
+    // pub async fn write_streaming_samples_to_tar<S>(
+    //     &self,
+    //     mut samples: S,
+    //     shard_id: usize,
+    // ) -> Result<()>
+    // where
+    //     S: Stream<Item = OutputSample> + Send + Unpin,
+    // {
+    //     let filepath = self.get_shard_name(shard_id);
+    //     let writer = self
+    //         .op
+    //         .writer_with(&filepath)
+    //         .chunk(16 * 1024 * 1024) // 16 MB chunk size
+    //         .await?;
+    //     let mut tar_writer = async_tar::Builder::new(writer.into_futures_async_write());
 
-        while let Some(sample) = samples.next().await {
-            let (json_path, json_data) = sample.to_json_file()?;
-            let (image_path, image_data) = sample.to_image_file()?;
-            let mut json_header = async_tar::Header::new_gnu();
-            json_header.set_path(json_path.clone())?;
-            json_header.set_size(json_data.len() as u64);
-            json_header.set_mode(0o644);
-            json_header.set_cksum();
-            let mut image_header = async_tar::Header::new_gnu();
-            image_header.set_path(image_path.clone())?;
-            image_header.set_size(image_data.len() as u64);
-            image_header.set_mode(0o644);
-            image_header.set_cksum();
-            tar_writer
-                .append_data(&mut json_header, json_path, json_data.as_slice())
-                .await?;
-            tar_writer
-                .append_data(&mut image_header, image_path, image_data.as_slice())
-                .await?;
-        }
+    //     while let Some(sample) = samples.next().await {
+    //         let (json_path, json_data) = sample.to_json_file()?;
+    //         let (image_path, image_data) = sample.to_image_file()?;
+    //         let mut json_header = async_tar::Header::new_gnu();
+    //         json_header.set_path(json_path.clone())?;
+    //         json_header.set_size(json_data.len() as u64);
+    //         json_header.set_mode(0o644);
+    //         json_header.set_cksum();
+    //         let mut image_header = async_tar::Header::new_gnu();
+    //         image_header.set_path(image_path.clone())?;
+    //         image_header.set_size(image_data.len() as u64);
+    //         image_header.set_mode(0o644);
+    //         image_header.set_cksum();
+    //         tar_writer
+    //             .append_data(&mut json_header, json_path, json_data.as_slice())
+    //             .await?;
+    //         tar_writer
+    //             .append_data(&mut image_header, image_path, image_data.as_slice())
+    //             .await?;
+    //     }
 
-        tar_writer.finish().await?;
-        tar_writer.into_inner().await?.close().await?;
+    //     tar_writer.finish().await?;
+    //     tar_writer.into_inner().await?.close().await?;
 
-        Ok(())
-    }
+    //     Ok(())
+    // }
 
-    pub async fn write_shard_parquet(
-        &self,
-        shard_id: usize,
-        samples: Vec<BatchSample>,
-    ) -> Result<()> {
-        let merged_samples = merge_batch_samples(samples)?;
+    pub async fn write_shard_parquet(&self, samples: ShardSample) -> Result<()> {
+        let merged_samples = merge_batch_samples(samples.samples)?;
         let mut schema_vec = vec![
-            Field::new("id", DataType::UInt64, false),
+            Field::new("id", DataType::FixedSizeBinary(16), false),
             Field::new("url", DataType::Utf8, false),
         ];
         let mut array_vec: Vec<Arc<dyn Array>> =
@@ -249,7 +259,7 @@ impl Writer {
         let batch = RecordBatch::try_new(schema.clone(), array_vec)?;
         let writer = self
             .op
-            .writer_with(&format!("{}.parquet", self.get_shard_name(shard_id)))
+            .writer_with(&self.get_shard_name(samples.shard_id))
             .await?;
         let mut writer = AsyncArrowWriter::try_new(
             writer.into_futures_async_write().compat_write(),

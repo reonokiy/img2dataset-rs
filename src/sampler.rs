@@ -256,6 +256,12 @@ pub struct BatchSample {
     pub additional_columns: HashMap<String, ArrayRef>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ShardSample {
+    pub shard_id: uuid::Uuid,
+    pub samples: Vec<BatchSample>,
+}
+
 use arrow_select::concat::concat;
 
 pub fn merge_batch_samples(batch_samples: Vec<BatchSample>) -> Result<BatchSample> {

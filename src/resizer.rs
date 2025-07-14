@@ -1,7 +1,8 @@
-use crate::sampler::{BatchSample, OutputSample, SampleStatus};
+use crate::sampler::{BatchSample, ShardSample};
 use anyhow::{Result, anyhow};
 use arrow::array::BinaryArray;
 use clap::ValueEnum;
+use futures::future::try_join_all;
 use image::{DynamicImage, GenericImageView, imageops::FilterType};
 use rayon::prelude::*;
 use std::io::Cursor;
@@ -85,6 +86,18 @@ impl Resizer {
         }
 
         Ok(buf.into_inner())
+    }
+
+    pub async fn shard_resize(&self, sample: ShardSample) -> Result<ShardSample> {
+        let resize_futures = sample
+            .samples
+            .iter()
+            .map(|sample| self.batch_resize(sample.clone()));
+        let resize_batchs = try_join_all(resize_futures).await?;
+        Ok(ShardSample {
+            shard_id: sample.shard_id,
+            samples: resize_batchs,
+        })
     }
 
     pub async fn batch_resize(&self, samples: BatchSample) -> Result<BatchSample> {
