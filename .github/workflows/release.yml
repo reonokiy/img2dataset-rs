@@ -63,6 +63,14 @@ jobs:
             target: x86_64-unknown-linux-musl
             artifact_name: img2dataset-rs
             asset_name: img2dataset-rs-linux-x86_64-musl
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            artifact_name: img2dataset-rs
+            asset_name: img2dataset-rs-linux-aarch64
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            artifact_name: img2dataset-rs
+            asset_name: img2dataset-rs-linux-aarch64-musl
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             artifact_name: img2dataset-rs.exe
@@ -88,6 +96,19 @@ jobs:
         if: matrix.target == 'x86_64-unknown-linux-musl'
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
+      - name: Install ARM64 cross-compilation tools
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Install ARM64 musl tools
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: |
+          sudo apt-get update && sudo apt-get install -y musl-tools
+          # Download and install musl cross-compiler for ARM64
+          wget https://musl.cc/aarch64-linux-musl-cross.tgz
+          tar -xzf aarch64-linux-musl-cross.tgz
+          echo "$PWD/aarch64-linux-musl-cross/bin" >> $GITHUB_PATH
+
       - name: Cache cargo registry
         uses: actions/cache@v4
         with:
@@ -108,6 +129,9 @@ jobs:
 
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-musl-gcc
 
       - name: Strip binary (Unix only)
         if: matrix.os != 'windows-latest'
