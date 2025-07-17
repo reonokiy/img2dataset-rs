@@ -1,6 +1,6 @@
 use crate::sampler::{ShardSample, merge_batch_samples};
 use anyhow::Result;
-use arrow::array::{Array, RecordBatch};
+use arrow::array::{Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use clap::ValueEnum;
 use opendal::Operator;
@@ -137,9 +137,18 @@ impl Writer {
         let mut schema_vec = vec![
             Field::new("_id", DataType::FixedSizeBinary(16), false),
             Field::new("_url", DataType::Utf8, false),
+            Field::new("_filepath", DataType::Utf8, false),
         ];
-        let mut array_vec: Vec<Arc<dyn Array>> =
-            vec![Arc::new(merged_samples.uuid), Arc::new(merged_samples.url)];
+        let filepath_array = StringArray::from(
+            std::iter::repeat(samples.original_filepath.clone())
+                .take(merged_samples.len)
+                .collect::<Vec<String>>(),
+        );
+        let mut array_vec: Vec<Arc<dyn Array>> = vec![
+            Arc::new(merged_samples.uuid),
+            Arc::new(merged_samples.url),
+            Arc::new(filepath_array),
+        ];
         if let Some(bytes) = merged_samples.bytes {
             schema_vec.push(Field::new("bytes", DataType::Binary, true));
             array_vec.push(Arc::new(bytes));
