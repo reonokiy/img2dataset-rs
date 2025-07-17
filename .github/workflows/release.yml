@@ -12,136 +12,32 @@ permissions:
   contents: write # Required for creating releases
 
 jobs:
-  create-release:
-    name: Create Release
-    runs-on: ubuntu-latest
-    outputs:
-      upload_url: ${{ steps.create_release.outputs.upload_url }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Generate changelog
-        run: |
-          # Extract version from tag
-          VERSION=${GITHUB_REF#refs/tags/}
-          echo "VERSION=$VERSION" >> $GITHUB_ENV
-
-          # Generate changelog from git commits since last tag
-          PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
-          if [ -n "$PREV_TAG" ]; then
-            echo "## Changes since $PREV_TAG" > CHANGELOG.md
-            git log --pretty=format:"- %s" $PREV_TAG..HEAD >> CHANGELOG.md
-          else
-            echo "## Initial Release" > CHANGELOG.md
-            git log --pretty=format:"- %s" >> CHANGELOG.md
-          fi
-
-      - name: Create Release
-        id: create_release
-        uses: softprops/action-gh-release@v1
-        with:
-          tag_name: ${{ env.VERSION }}
-          name: ${{ env.VERSION }}
-          body_path: CHANGELOG.md
-          draft: false
-          prerelease: false
-
-  build:
-    name: Build and Upload
-    runs-on: ${{ matrix.os }}
-    needs: create-release
+  release:
+    name: Release - ${{ matrix.platform.os-name }}
     strategy:
       matrix:
-        include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            artifact_name: img2dataset-rs
-            asset_name: img2dataset-rs-linux-x86_64
-          - os: ubuntu-latest
+        platform:
+          - os-name: Linux-x86_64
+            runs-on: ubuntu-24.04
             target: x86_64-unknown-linux-musl
-            artifact_name: img2dataset-rs
-            asset_name: img2dataset-rs-linux-x86_64-musl
-          - os: ubuntu-latest
-            target: aarch64-unknown-linux-gnu
-            artifact_name: img2dataset-rs
-            asset_name: img2dataset-rs-linux-aarch64
-          - os: ubuntu-latest
+
+          - os-name: Linux-aarch64
+            runs-on: ubuntu-24.04
             target: aarch64-unknown-linux-musl
-            artifact_name: img2dataset-rs
-            asset_name: img2dataset-rs-linux-aarch64-musl
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            artifact_name: img2dataset-rs.exe
-            asset_name: img2dataset-rs-windows-x86_64.exe
-          - os: macos-latest
-            target: x86_64-apple-darwin
-            artifact_name: img2dataset-rs
-            asset_name: img2dataset-rs-macos-x86_64
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            artifact_name: img2dataset-rs
-            asset_name: img2dataset-rs-macos-aarch64
 
+    runs-on: ${{ matrix.platform.runs-on }}
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Build binary
+        uses: houseabsolute/actions-rust-cross@v1
         with:
-          targets: ${{ matrix.target }}
-
-      - name: Install musl tools (Linux musl only)
-        if: matrix.target == 'x86_64-unknown-linux-musl'
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
-
-      - name: Install ARM64 cross-compilation tools
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
-
-      - name: Install ARM64 musl tools
-        if: matrix.target == 'aarch64-unknown-linux-musl'
-        run: |
-          sudo apt-get update && sudo apt-get install -y musl-tools
-          # Download and install musl cross-compiler for ARM64
-          wget https://musl.cc/aarch64-linux-musl-cross.tgz
-          tar -xzf aarch64-linux-musl-cross.tgz
-          echo "$PWD/aarch64-linux-musl-cross/bin" >> $GITHUB_PATH
-
-      - name: Cache cargo registry
-        uses: actions/cache@v4
+          command: build
+          target: ${{ matrix.platform.target }}
+          args: "--locked --release"
+          strip: true
+      - name: Publish artifacts and release
+        uses: houseabsolute/actions-rust-release@v0
         with:
-          path: ~/.cargo/registry
-          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Cache cargo index
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/git
-          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Cache cargo build
-        uses: actions/cache@v4
-        with:
-          path: target
-          key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-musl-gcc
-
-      - name: Strip binary (Unix only)
-        if: matrix.os != 'windows-latest'
-        run: strip target/${{ matrix.target }}/release/${{ matrix.artifact_name }}
-
-      - name: Upload binary to release
-        uses: svenstaro/upload-release-action@v2
-        with:
-          repo_token: ${{ secrets.GITHUB_TOKEN }}
-          file: target/${{ matrix.target }}/release/${{ matrix.artifact_name }}
-          asset_name: ${{ matrix.asset_name }}
-          tag: ${{ github.ref_name }}
-          overwrite: true
+          executable-name: ubi
+          target: ${{ matrix.platform.target }}
