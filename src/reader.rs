@@ -40,6 +40,7 @@ pub struct ReaderOptions {
     pub batch_size: usize,
     pub batch_per_shard: usize,
     pub opendal_buffer_size: usize,
+    pub file_filter: Option<glob::Pattern>,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -134,6 +135,11 @@ impl Reader {
         let stream_of_streams = stream! {
             let mut file_lister = file_lister;
             while let Some(Ok(file)) = file_lister.next().await {
+                if let Some(filter) = &config.file_filter {
+                    if !filter.matches(file.name()) {
+                        continue;
+                    }
+                }
                 if file.name().ends_with(config.format.extension()) {
                     {
                         let filepath = file.path();

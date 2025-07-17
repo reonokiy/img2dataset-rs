@@ -81,6 +81,8 @@ struct Args {
     reader_batch_per_shard: usize,
     #[clap(long, default_value_t = 16 * 1024 * 1024)]
     reader_opendal_buffer_size: usize,
+    #[clap(long)]
+    reader_file_filter: Option<String>,
 
     // Resizer options
     #[clap(long, default_value_t = false)]
@@ -177,6 +179,9 @@ async fn debug_read(args: Args) -> Result<()> {
         batch_size: args.reader_batch_size,
         batch_per_shard: args.reader_batch_per_shard,
         opendal_buffer_size: args.reader_opendal_buffer_size,
+        file_filter: args
+            .reader_file_filter
+            .map(|f| glob::Pattern::new(&f).unwrap()),
     };
 
     let downloader_options = DownloaderOptions {
@@ -283,6 +288,9 @@ async fn main_run(args: Args) -> Result<()> {
         batch_size: args.reader_batch_size,
         batch_per_shard: args.reader_batch_per_shard,
         opendal_buffer_size: args.reader_opendal_buffer_size,
+        file_filter: args
+            .reader_file_filter
+            .map(|f| glob::Pattern::new(&f).unwrap()),
     };
 
     let downloader_options = DownloaderOptions {
