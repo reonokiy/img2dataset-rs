@@ -1,18 +1,22 @@
-use arrow::array::BinaryArray;
+use anyhow::Result;
+use arrow::array::{BinaryArray, BinaryBuilder};
 use futures::stream::{self, StreamExt};
+use opentelemetry::{KeyValue, global};
 use reqwest::{Client, Response};
-use std::sync::Arc;
+use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
+use reqwest_tracing::TracingMiddleware;
 use std::time::Duration;
+use std::{error::Error, sync::Arc};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tracing::instrument;
 
-use crate::sampler::{BatchSample, InputSample, OutputSample, SampleStatus, ShardSample};
+use crate::sampler::{BatchSample, ShardSample};
 
 /// The `Downloader` is responsible for downloading images from URLs.
 #[derive(Clone)]
 pub struct Downloader {
-    client: Client,
+    client: ClientWithMiddleware,
     options: DownloaderOptions,
 }
 
@@ -26,25 +30,25 @@ pub struct DownloaderOptions {
 }
 
 impl Downloader {
-    #[instrument]
     pub fn new(options: DownloaderOptions) -> Self {
-        let client = Client::builder()
+        let reqwest_client = Client::builder()
             .user_agent(options.user_agent.clone())
             .timeout(Duration::from_secs(options.timeout))
             .build()
             .expect("Failed to create HTTP client");
+        let client = ClientBuilder::new(reqwest_client)
+            // Insert the tracing middleware
+            .with(TracingMiddleware::default())
+            .build();
 
         Self { client, options }
     }
 
-    #[instrument(skip(self))]
     pub async fn shard_download(&self, shard: ShardSample) -> ShardSample {
-        tracing::info!("Starting download for shard {}", shard.shard_id);
         let downloaded_bytes = stream::iter(shard.samples.iter())
             .then(|sample| self.batch_download(sample.clone()))
             .collect()
             .await;
-        tracing::info!("Completed download for shard {}", shard.shard_id);
         ShardSample {
             original_filepath: shard.original_filepath,
             shard_id: shard.shard_id,
@@ -52,7 +56,6 @@ impl Downloader {
         }
     }
 
-    #[instrument(skip(self))]
     pub async fn batch_download(&self, inputs: BatchSample) -> BatchSample {
         let mut blobs: Vec<Vec<u8>> = vec![vec![]; inputs.len];
         let mut set = JoinSet::new();
@@ -72,10 +75,7 @@ impl Downloader {
                         let result = downloader.single_download(url).await;
                         match result {
                             Ok(data) => (i, Some(data)),
-                            Err(e) => {
-                                tracing::warn!("{}", e.to_string());
-                                (i, None)
-                            }
+                            Err(e) => (i, None),
                         }
                     }
                     None => (i, None),
@@ -90,7 +90,16 @@ impl Downloader {
             }
         }
 
-        let data = BinaryArray::from_vec(blobs.iter().map(|b| b.as_slice()).collect::<Vec<_>>());
+        let mut array_builder = BinaryBuilder::new();
+        for blob in blobs {
+            if blob.is_empty() {
+                array_builder.append_null();
+            } else {
+                array_builder.append_value(blob.as_slice());
+            }
+        }
+        let data = array_builder.finish();
+
         BatchSample {
             len: inputs.len,
             uuid: inputs.uuid,
@@ -186,10 +195,38 @@ impl Downloader {
     //     }
     // }
 
-    #[instrument(skip(self))]
     async fn single_download(&self, url: String) -> anyhow::Result<Vec<u8>> {
-        let response = self.client.get(&url).send().await?;
+        let meter = global::meter(module_path!());
+        let download_counter = meter
+            .u64_counter("download.start")
+            .with_description("Counter for download start events")
+            .build();
+
+        let response = match self.client.get(&url).send().await {
+            Ok(resp) => resp,
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "Failed to download {}: {:?}",
+                    url,
+                    e.source()
+                ));
+            }
+        };
+        download_counter.add(
+            1,
+            &[
+                KeyValue::new("url", url.clone()),
+                KeyValue::new("user_agent", self.options.user_agent.clone()),
+                KeyValue::new("status", response.status().to_string()),
+                KeyValue::new(
+                    "content_length",
+                    response.content_length().unwrap_or(0).to_string(),
+                ),
+            ],
+        );
+        tracing::debug!("Downloaded {} with status {}", url, response.status());
         if self.is_disallowed(&response) {
+            tracing::warn!("Download {} disallowed by X-Robots-Tag", url);
             return Err(anyhow::anyhow!(
                 "Failed to download {}: Disallowed by X-Robots-Tag",
                 url
@@ -206,7 +243,6 @@ impl Downloader {
         Ok(response.bytes().await?.to_vec())
     }
 
-    #[instrument(skip(self))]
     fn is_disallowed(&self, response: &Response) -> bool {
         if self.options.disallowed_header_directives.is_empty() {
             return false;

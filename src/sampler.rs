@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::ptr::null;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -286,6 +287,18 @@ pub struct ShardSample {
     pub samples: Vec<BatchSample>,
 }
 
+impl ShardSample {
+    pub fn get_valid_bytes_count(&self) -> usize {
+        self.samples
+            .iter()
+            .map(|s| s.bytes.as_ref().map(|b| s.len - b.null_count()))
+            .sum::<Option<usize>>()
+            .unwrap_or(0)
+    }
+    pub fn len(&self) -> usize {
+        self.samples.iter().map(|s| s.len).sum()
+    }
+}
 use arrow_select::concat::concat;
 
 pub fn merge_batch_samples(batch_samples: Vec<BatchSample>) -> Result<BatchSample> {

@@ -64,7 +64,6 @@ pub struct Writer {
 }
 
 impl Writer {
-    #[instrument]
     pub fn new(options: WriterOptions) -> Result<Self> {
         let op = match &options.backend {
             OutputBackend::Fs => {
@@ -111,7 +110,6 @@ impl Writer {
         Ok(Self { op, options })
     }
 
-    #[instrument]
     pub async fn shard_write(&self, samples: ShardSample) -> Result<()> {
         match self.options.format {
             OutputFormat::Parquet => self.write_shard_parquet(samples).await,
@@ -236,7 +234,6 @@ impl Writer {
     //     Ok(())
     // }
 
-    #[instrument(skip(self))]
     pub async fn write_shard_parquet(&self, samples: ShardSample) -> Result<()> {
         let merged_samples = merge_batch_samples(samples.samples)?;
         let mut schema_vec = vec![

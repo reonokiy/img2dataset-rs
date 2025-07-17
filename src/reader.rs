@@ -134,7 +134,6 @@ impl Reader {
         })
     }
 
-    #[instrument]
     pub async fn shard_read(
         &self,
     ) -> anyhow::Result<impl Stream<Item = anyhow::Result<ShardSample>>> {
@@ -613,6 +612,7 @@ async fn read_parquet_shard(
             }
 
             if shard_sample.samples.len() >= options.batch_per_shard {
+                shard_sample.shard_id = uuid::Uuid::now_v7();
                 yield Ok(shard_sample.clone());
                 shard_sample.samples.clear();
             } else {
@@ -626,6 +626,7 @@ async fn read_parquet_shard(
             }
         }
         if !shard_sample.samples.is_empty() {
+            shard_sample.shard_id = uuid::Uuid::now_v7();
             yield Ok(shard_sample);
         }
     };

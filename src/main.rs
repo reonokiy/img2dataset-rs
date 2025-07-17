@@ -1,5 +1,4 @@
-use crate::downloader::DownloaderOptions;
-use crate::manager::{PipelineManager, PipelineOptions};
+use crate::downloader::{Downloader, DownloaderOptions};
 use crate::observability::{ObservabilityManager, ObservabilityOptions};
 use crate::reader::{InputFormat, Reader, ReaderBackend, ReaderOptions};
 use crate::resizer::{ImageFormat, ResizeMode, ResizerOptions};
@@ -7,15 +6,13 @@ use crate::sampler::{BatchSample, ShardSample};
 use crate::writer::{OutputBackend, OutputFormat, Writer, WriterOptions};
 use anyhow::Result;
 use anyhow::anyhow;
-use arrow::array::StringArray;
 use clap::{Parser, Subcommand};
 use futures::stream::StreamExt;
-use rayon::option;
 use std::time::Instant;
 
 pub mod downloader;
-pub mod manager;
 mod observability;
+mod pipeline;
 pub mod reader;
 pub mod resizer;
 mod sampler;
@@ -132,53 +129,36 @@ struct Args {
     writer_b2_application_key: Option<String>,
     #[clap(long, default_value = "")]
     writer_shard_prefix: String,
-    #[clap(long, default_value_t = 1)]
-    min_writers: usize,
-    #[clap(long, default_value_t = 10)]
-    max_writers: usize,
 
     // Downloader options
     #[clap(long, default_values_t = vec!["noai".to_string(), "noimageai".to_string(), "noindex".to_string(), "noimageindex".to_string()])]
     disallowed_header_directives: Vec<String>,
     #[clap(long, default_value_t = 64)]
-    downloader_thread_count: usize,
+    downloader_concurrency: usize,
     #[clap(long, default_value_t = 10)]
     timeout: u64,
-    #[clap(long, default_value_t = 1)]
+    #[clap(long, default_value_t = 0)]
     retries: u32,
     #[clap(
         long,
         default_value = "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:72.0) Gecko/20100101 Firefox/72.0 (compatible; +https://github.com/reonokiy/img2dataset-rs)"
     )]
     user_agent: String,
-    #[clap(long, default_value_t = 1)]
-    minimum_downloaders: usize,
-    #[clap(long, default_value_t = 10)]
-    maximum_downloaders: usize,
 
     // Pipeline options
-    #[clap(long, default_value_t = 1024)]
-    buffer_size: usize,
-    #[clap(long, default_value_t = 0.9)]
-    memory_threshold: f32,
-    #[clap(long, default_value_t = 0.8)]
-    scale_up_threshold: f32,
-    #[clap(long, default_value_t = 0.2)]
-    scale_down_threshold: f32,
-    #[clap(long, default_value_t = 1000)]
-    manager_check_interval_ms: u64,
+    #[clap(long, default_value_t = 16)]
+    shard_concurrency: usize,
 
     // Observability options
     #[clap(value_enum, long, default_value = "info")]
     log_level: tracing::Level,
+    #[clap(long, default_value_t = false)]
+    enable_otel: bool,
+    #[clap(long, default_value = "http://localhost:4317")]
+    otel_endpoint: String,
 }
 
 async fn debug_read(args: Args) -> Result<()> {
-    let observability_options = ObservabilityOptions {
-        log_level: args.log_level.into(),
-    };
-    let mut observability_manager = ObservabilityManager::new(observability_options);
-
     tracing::info!("Starting debug read mode");
     let reader_options = ReaderOptions {
         format: args.reader_format,
@@ -199,8 +179,17 @@ async fn debug_read(args: Args) -> Result<()> {
         opendal_buffer_size: args.reader_opendal_buffer_size,
     };
 
+    let downloader_options = DownloaderOptions {
+        thread: args.downloader_concurrency,
+        timeout: args.timeout,
+        retries: args.retries,
+        user_agent: args.user_agent,
+        disallowed_header_directives: args.disallowed_header_directives,
+    };
+
     let reader = Reader::new(reader_options)
         .map_err(|e| anyhow!("Failed to create reader: {}", e.to_string()))?;
+    let downloader = Downloader::new(downloader_options);
     let mut stream = reader
         .shard_read()
         .await
@@ -212,6 +201,7 @@ async fn debug_read(args: Args) -> Result<()> {
         count += 1;
         match sample {
             Ok(s) => {
+                downloader.shard_download(s.clone()).await;
                 tracing::debug!("Processing sample {}: {:?}", count, s);
             }
             Err(e) => {
@@ -227,7 +217,6 @@ async fn debug_read(args: Args) -> Result<()> {
         debug_duration.as_secs_f64()
     );
 
-    observability_manager.shutdown().await?;
     Ok(())
 }
 
@@ -271,7 +260,9 @@ async fn debug_write(args: Args) -> Result<()> {
 
 async fn main_run(args: Args) -> Result<()> {
     let observability_options = ObservabilityOptions {
-        log_level: args.log_level.into(),
+        log_level: args.log_level,
+        enable_otel: args.enable_otel,
+        otel_endpoint: args.otel_endpoint.clone(),
     };
     let mut observability_manager = ObservabilityManager::new(observability_options);
 
@@ -295,7 +286,7 @@ async fn main_run(args: Args) -> Result<()> {
     };
 
     let downloader_options = DownloaderOptions {
-        thread: args.downloader_thread_count,
+        thread: args.downloader_concurrency,
         timeout: args.timeout,
         retries: args.retries,
         user_agent: args.user_agent,
@@ -328,28 +319,15 @@ async fn main_run(args: Args) -> Result<()> {
         shard_prefix: args.writer_shard_prefix,
     };
 
-    let pipeline_options = PipelineOptions {
+    let pipeline_options = pipeline::PipelineOptions {
         reader_options,
         downloader_options,
         resizer_options,
         writer_options,
-        buffer_size: args.buffer_size,
-        min_resizers: args.min_resizers,
-        max_resizers: args.max_resizers,
-        min_writers: args.min_writers,
-        max_writers: args.max_writers,
-        min_downloaders: args.minimum_downloaders,
-        max_downloaders: args.minimum_downloaders,
-        memory_threshold: args.memory_threshold,
-        scale_up_threshold: args.scale_up_threshold,
-        scale_down_threshold: args.scale_down_threshold,
-        manager_check_interval_ms: args.manager_check_interval_ms,
+        concurrency: args.shard_concurrency,
     };
 
-    tracing::info!("Starting pipeline manager");
-    let pipeline_manager = PipelineManager::new(pipeline_options);
-    pipeline_manager.run().await?;
-    tracing::info!("Pipeline manager completed");
+    pipeline::pipeline(pipeline_options).await?;
 
     observability_manager.shutdown().await?;
     Ok(())
