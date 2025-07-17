@@ -1,5 +1,4 @@
-use anyhow::Result;
-use arrow::array::{BinaryArray, BinaryBuilder};
+use arrow::array::BinaryBuilder;
 use futures::stream::{self, StreamExt};
 use opentelemetry::{KeyValue, global};
 use reqwest::{Client, Response};
@@ -9,7 +8,6 @@ use std::time::Duration;
 use std::{error::Error, sync::Arc};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
-use tracing::instrument;
 
 use crate::sampler::{BatchSample, ShardSample};
 
@@ -109,92 +107,6 @@ impl Downloader {
         }
     }
 
-    /// Downloads an image from a URL.
-    ///
-    /// # Arguments
-    ///
-    /// * `input` - The input sample containing the URL to download.
-    ///
-    /// # Returns
-    ///
-    /// An `OutputSample` with either success or failure status.
-    // pub async fn download(&self, input: InputSample) -> OutputSample {
-    //     let mut last_err = None;
-    //     for i in 0..=self.options.retries {
-    //         match self.client.get(input.url.clone()).send().await {
-    //             Ok(response) => {
-    //                 if self.is_disallowed(&response) {
-    //                     return OutputSample {
-    //                         id: input.id,
-    //                         original_filepath: input.original_filepath,
-    //                         download_data: Vec::new(),
-    //                         download_mime_type: None,
-    //                         download_timestamp: Some(chrono::Utc::now()),
-    //                         url: input.url,
-    //                         caption: input.caption,
-    //                         additional_columns: input.additional_columns,
-    //                         status: SampleStatus::Failure("X-Robots-Tag disallowed".to_string()),
-    //                     };
-    //                 }
-    //                 let mime_type = response
-    //                     .headers()
-    //                     .get("Content-Type")
-    //                     .and_then(|v| v.to_str().ok())
-    //                     .map(|s| s.to_string());
-    //                 match response.bytes().await {
-    //                     Ok(data) => {
-    //                         let data_vec = data.to_vec();
-    //                         tracing::info!("Successfully downloaded {}", input.url);
-    //                         return OutputSample {
-    //                             id: input.id,
-    //                             original_filepath: input.original_filepath,
-    //                             download_data: data_vec,
-    //                             download_mime_type: mime_type.map(|s| s.to_string()),
-    //                             download_timestamp: Some(chrono::Utc::now()),
-    //                             url: input.url,
-    //                             caption: input.caption,
-    //                             additional_columns: input.additional_columns,
-    //                             status: SampleStatus::Success,
-    //                         };
-    //                     }
-    //                     Err(e) => {
-    //                         tracing::warn!(
-    //                             "[Try {}] Failed to read bytes from {}: {}",
-    //                             i,
-    //                             input.url,
-    //                             e
-    //                         );
-    //                         last_err = Some(e);
-    //                     }
-    //                 }
-    //             }
-    //             Err(e) => {
-    //                 tracing::warn!("[Try {}] Failed to download {}: {}", i, input.url, e);
-    //                 last_err = Some(e);
-    //             }
-    //         }
-    //     }
-
-    //     // Return failure sample if all retries failed
-    //     OutputSample {
-    //         id: input.id,
-    //         original_filepath: input.original_filepath,
-    //         download_data: Vec::new(),
-    //         download_mime_type: None,
-    //         download_timestamp: Some(chrono::Utc::now()),
-    //         url: input.url,
-    //         caption: input.caption,
-    //         additional_columns: input.additional_columns,
-    //         status: SampleStatus::Failure(format!(
-    //             "Download failed after {} retries: {}",
-    //             self.options.retries,
-    //             last_err
-    //                 .map(|e| e.to_string())
-    //                 .unwrap_or_else(|| "Unknown error".to_string())
-    //         )),
-    //     }
-    // }
-
     async fn single_download(&self, url: String) -> anyhow::Result<Vec<u8>> {
         let meter = global::meter(module_path!());
         let download_counter = meter
@@ -224,17 +136,17 @@ impl Downloader {
                 ),
             ],
         );
-        tracing::debug!("Downloaded {} with status {}", url, response.status());
         if self.is_disallowed(&response) {
-            tracing::warn!("Download {} disallowed by X-Robots-Tag", url);
+            tracing::debug!("Download {} disallowed by X-Robots-Tag", url);
             return Err(anyhow::anyhow!(
                 "Failed to download {}: Disallowed by X-Robots-Tag",
                 url
             ));
         }
         if !response.status().is_success() {
+            tracing::debug!("Failed to download {}: {}", url, response.status());
             return Err(anyhow::anyhow!(
-                "Failed to download {}: Unsuccessful status code {}",
+                "Failed to download {}: {}",
                 url,
                 response.status()
             ));

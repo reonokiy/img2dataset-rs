@@ -1,8 +1,5 @@
 use anyhow::Result;
-use std::sync::{
-    Arc,
-    atomic::{AtomicU64, Ordering},
-};
+use std::sync::Arc;
 use tokio::time::Instant;
 
 use futures::stream::StreamExt;
@@ -22,55 +19,7 @@ pub struct PipelineOptions {
     pub concurrency: usize,
 }
 
-#[derive(Debug, Clone)]
-pub struct PipelineStatus {
-    pub read_shards: Arc<AtomicU64>,
-    pub downloaded_shards: Arc<AtomicU64>,
-    pub error_shards: Arc<AtomicU64>,
-    pub read_samples: Arc<AtomicU64>,
-    pub downloaded_samples: Arc<AtomicU64>,
-    pub written_samples: Arc<AtomicU64>,
-}
-
-impl PipelineStatus {
-    pub fn new() -> Self {
-        Self {
-            read_shards: Arc::new(AtomicU64::new(0)),
-            downloaded_shards: Arc::new(AtomicU64::new(0)),
-            error_shards: Arc::new(AtomicU64::new(0)),
-            read_samples: Arc::new(AtomicU64::new(0)),
-            downloaded_samples: Arc::new(AtomicU64::new(0)),
-            written_samples: Arc::new(AtomicU64::new(0)),
-        }
-    }
-
-    pub fn increment_read_shards(&mut self) {
-        self.read_shards.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn increment_downloaded_shards(&mut self) {
-        self.downloaded_shards.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn increment_error_shards(&mut self) {
-        self.error_shards.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn increment_read_samples(&mut self) {
-        self.read_samples.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn increment_downloaded_samples(&mut self) {
-        self.downloaded_samples.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn increment_written_samples(&mut self) {
-        self.written_samples.fetch_add(1, Ordering::Relaxed);
-    }
-}
-
 pub async fn pipeline(options: PipelineOptions) -> Result<()> {
-    let status = PipelineStatus::new();
     let reader = Reader::new(options.reader_options)?;
     let downloader = Arc::new(Downloader::new(options.downloader_options));
     let resizer = Arc::new(Resizer::new(options.resizer_options));
@@ -78,7 +27,6 @@ pub async fn pipeline(options: PipelineOptions) -> Result<()> {
     let shards = reader.shard_read().await?;
     shards
         .for_each_concurrent(options.concurrency, |shard| {
-            let mut status = status.clone();
             let downloader = downloader.clone();
             let resizer = resizer.clone();
             let writer = writer.clone();
@@ -130,11 +78,9 @@ pub async fn pipeline(options: PipelineOptions) -> Result<()> {
                 match write_result {
                     Ok(_) => {
                         tracing::info!("Shard {} written successfully", read_shard.shard_id);
-                        status.increment_written_samples()
                     }
                     Err(e) => {
                         tracing::error!("Error writing shard: {}", e);
-                        status.increment_error_shards();
                     }
                 }
             }
