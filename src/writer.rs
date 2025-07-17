@@ -150,7 +150,7 @@ impl Writer {
             Arc::new(filepath_array),
         ];
         if let Some(bytes) = merged_samples.bytes {
-            schema_vec.push(Field::new("bytes", DataType::Binary, true));
+            schema_vec.push(Field::new("_data", DataType::Binary, true));
             array_vec.push(Arc::new(bytes));
         }
         for (key, value) in merged_samples.additional_columns.iter() {
