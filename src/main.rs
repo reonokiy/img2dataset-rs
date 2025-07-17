@@ -99,10 +99,6 @@ struct Args {
     resize_image_width: u32,
     #[clap(long, default_value_t = false)]
     resize_only_if_bigger: bool,
-    #[clap(long, default_value_t = 1)]
-    min_resizers: usize,
-    #[clap(long, default_value_t = 10)]
-    max_resizers: usize,
 
     // Writer options
     #[clap(long)]
@@ -135,7 +131,7 @@ struct Args {
     // Downloader options
     #[clap(long, default_values_t = vec!["noai".to_string(), "noimageai".to_string(), "noindex".to_string(), "noimageindex".to_string()])]
     disallowed_header_directives: Vec<String>,
-    #[clap(long, default_value_t = 64)]
+    #[clap(long, default_value_t = 16)]
     downloader_concurrency: usize,
     #[clap(long, default_value_t = 10)]
     timeout: u64,
@@ -148,7 +144,7 @@ struct Args {
     user_agent: String,
 
     // Pipeline options
-    #[clap(long, default_value_t = 16)]
+    #[clap(long, default_value_t = 4)]
     shard_concurrency: usize,
 
     // Observability options
