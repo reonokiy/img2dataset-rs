@@ -4,7 +4,7 @@ use arrow::array::{Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use clap::ValueEnum;
 use opendal::Operator;
-use opendal::services::{Fs, S3};
+use opendal::services::{B2, Fs, S3};
 use parquet::arrow::AsyncArrowWriter;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -54,6 +54,53 @@ pub struct WriterOptions {
     pub shard_prefix: String,
 }
 
+impl WriterOptions {
+    pub fn get_operator(&self) -> Result<Operator> {
+        let op = match &self.backend {
+            OutputBackend::Fs => {
+                let builder = Fs::default().root(&self.root);
+                Operator::new(builder)?.finish()
+            }
+            OutputBackend::S3 => {
+                let mut builder = S3::default().root(&self.root);
+                if let Some(bucket) = &self.s3_bucket {
+                    builder = builder.bucket(bucket);
+                }
+                if let Some(region) = &self.s3_region {
+                    builder = builder.region(region);
+                }
+                if let Some(access_key) = &self.s3_access_key {
+                    builder = builder.access_key_id(access_key);
+                }
+                if let Some(secret_key) = &self.s3_secret_key {
+                    builder = builder.secret_access_key(secret_key);
+                }
+                if let Some(endpoint) = &self.s3_endpoint {
+                    builder = builder.endpoint(endpoint);
+                }
+                Operator::new(builder)?.finish()
+            }
+            OutputBackend::B2 => {
+                let mut builder = B2::default().root(&self.root);
+                if let Some(bucket) = &self.b2_bucket {
+                    builder = builder.bucket(bucket);
+                }
+                if let Some(bucket_id) = &self.b2_bucket_id {
+                    builder = builder.bucket_id(bucket_id);
+                }
+                if let Some(application_key_id) = &self.b2_application_key_id {
+                    builder = builder.application_key_id(application_key_id);
+                }
+                if let Some(application_key) = &self.b2_application_key {
+                    builder = builder.application_key(application_key);
+                }
+                Operator::new(builder)?.finish()
+            }
+        };
+        Ok(op)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Writer {
     op: Operator,
@@ -62,48 +109,7 @@ pub struct Writer {
 
 impl Writer {
     pub fn new(options: WriterOptions) -> Result<Self> {
-        let op = match &options.backend {
-            OutputBackend::Fs => {
-                let builder = Fs::default().root(&options.root);
-                Operator::new(builder)?.finish()
-            }
-            OutputBackend::S3 => {
-                let mut builder = S3::default().root(&options.root);
-                if let Some(bucket) = &options.s3_bucket {
-                    builder = builder.bucket(bucket);
-                }
-                if let Some(region) = &options.s3_region {
-                    builder = builder.region(region);
-                }
-                if let Some(access_key) = &options.s3_access_key {
-                    builder = builder.access_key_id(access_key);
-                }
-                if let Some(secret_key) = &options.s3_secret_key {
-                    builder = builder.secret_access_key(secret_key);
-                }
-                if let Some(endpoint) = &options.s3_endpoint {
-                    builder = builder.endpoint(endpoint);
-                }
-                Operator::new(builder)?.finish()
-            }
-            OutputBackend::B2 => {
-                let mut builder = opendal::services::B2::default().root(&options.root);
-                if let Some(bucket) = &options.b2_bucket {
-                    builder = builder.bucket(bucket);
-                }
-                if let Some(bucket_id) = &options.b2_bucket_id {
-                    builder = builder.bucket_id(bucket_id);
-                }
-                if let Some(application_key_id) = &options.b2_application_key_id {
-                    builder = builder.application_key_id(application_key_id);
-                }
-                if let Some(application_key) = &options.b2_application_key {
-                    builder = builder.application_key(application_key);
-                }
-                Operator::new(builder)?.finish()
-            }
-        };
-
+        let op = options.get_operator()?;
         Ok(Self { op, options })
     }
 
@@ -162,6 +168,7 @@ impl Writer {
         let writer = self
             .op
             .writer_with(&self.get_shard_name(samples.shard_id))
+            .chunk(16 * 1024 * 1024)
             .await?;
         let mut writer = AsyncArrowWriter::try_new(
             writer.into_futures_async_write().compat_write(),

@@ -3,6 +3,7 @@ use crate::observability::{ObservabilityManager, ObservabilityOptions};
 use crate::reader::{InputFormat, Reader, ReaderBackend, ReaderOptions};
 use crate::resizer::{ImageFormat, ResizeMode, ResizerOptions};
 use crate::sampler::{BatchSample, ShardSample};
+use crate::sync::{SyncOptions, Synchronizer};
 use crate::writer::{OutputBackend, OutputFormat, Writer, WriterOptions};
 use anyhow::Result;
 use anyhow::anyhow;
@@ -16,12 +17,15 @@ mod pipeline;
 pub mod reader;
 pub mod resizer;
 mod sampler;
+mod sync;
 pub mod writer;
 
 #[derive(Subcommand, Debug)]
 enum Command {
     /// Run the main image downloading and processing pipeline
     Run(Args),
+    // Sync the dataset from other output backends to local filesystem
+    Sync(SyncArgs),
     /// A subcommand for debugging purposes
     Debug(DebugCommand),
 }
@@ -146,6 +150,76 @@ struct Args {
     // Pipeline options
     #[clap(long, default_value_t = 4)]
     shard_concurrency: usize,
+
+    // Observability options
+    #[clap(value_enum, long, default_value = "info")]
+    log_level: tracing::Level,
+    #[clap(long, default_value_t = false)]
+    enable_otel: bool,
+    #[clap(long, default_value = "http://localhost:4317")]
+    otel_endpoint: String,
+}
+
+#[derive(Parser, Debug)]
+struct SyncArgs {
+    #[clap(long)]
+    writer_root: String,
+    #[clap(value_enum, long)]
+    writer_backend: OutputBackend,
+    #[clap(value_enum, long, default_value_t = OutputFormat::Parquet)]
+    writer_format: OutputFormat,
+    #[clap(long)]
+    writer_s3_bucket: Option<String>,
+    #[clap(long)]
+    writer_s3_region: Option<String>,
+    #[clap(long)]
+    writer_s3_access_key: Option<String>,
+    #[clap(long)]
+    writer_s3_secret_key: Option<String>,
+    #[clap(long)]
+    writer_s3_endpoint: Option<String>,
+    #[clap(long)]
+    writer_b2_bucket: Option<String>,
+    #[clap(long)]
+    writer_b2_bucket_id: Option<String>,
+    #[clap(long)]
+    writer_b2_application_key_id: Option<String>,
+    #[clap(long)]
+    writer_b2_application_key: Option<String>,
+    #[clap(long, default_value = "")]
+    writer_shard_prefix: String,
+
+    // Sync Specific Options
+    #[clap(long)]
+    sync_root: String,
+
+    // Delete remote files after sync
+    #[clap(long, default_value_t = false)]
+    sync_and_delete: bool,
+
+    // Skip recent uploaded files to avoid sync and delte incomplete shards
+    #[clap(long, default_value_t = 60 * 60)]
+    skip_recent_seconds: i64,
+
+    // Reader chunk size
+    #[clap(long, default_value_t = 10 * 1024 * 1024)]
+    reader_chunk_size: usize,
+
+    // Writer chunk size
+    #[clap(long, default_value_t = 10 * 1024 * 1024)]
+    writer_chunk_size: usize,
+
+    // Reader concurrent
+    #[clap(long, default_value_t = 1)]
+    reader_concurrent: usize,
+
+    // Writer concurrent
+    #[clap(long, default_value_t = 1)]
+    writer_concurrent: usize,
+
+    // Verify content length
+    #[clap(long, default_value_t = true)]
+    verify_content_length: bool,
 
     // Observability options
     #[clap(value_enum, long, default_value = "info")]
@@ -337,11 +411,54 @@ async fn main_run(args: Args) -> Result<()> {
     Ok(())
 }
 
+async fn main_sync(args: SyncArgs) -> Result<()> {
+    let observability_options = ObservabilityOptions {
+        log_level: args.log_level,
+        enable_otel: args.enable_otel,
+        otel_endpoint: args.otel_endpoint.clone(),
+    };
+    let mut observability_manager = ObservabilityManager::new(observability_options);
+
+    let writer_options = WriterOptions {
+        root: args.writer_root,
+        format: args.writer_format,
+        backend: args.writer_backend,
+        s3_bucket: args.writer_s3_bucket,
+        s3_region: args.writer_s3_region,
+        s3_access_key: args.writer_s3_access_key,
+        s3_secret_key: args.writer_s3_secret_key,
+        s3_endpoint: args.writer_s3_endpoint,
+        b2_bucket: args.writer_b2_bucket,
+        b2_bucket_id: args.writer_b2_bucket_id,
+        b2_application_key_id: args.writer_b2_application_key_id,
+        b2_application_key: args.writer_b2_application_key,
+        shard_prefix: args.writer_shard_prefix,
+    };
+
+    let sync_options = SyncOptions {
+        root: args.sync_root,
+        sync_and_delete: args.sync_and_delete,
+        skip_recent_seconds: args.skip_recent_seconds,
+        reader_chunk_size: args.reader_chunk_size,
+        writer_chunk_size: args.writer_chunk_size,
+        reader_concurrent: args.reader_concurrent,
+        writer_concurrent: args.writer_concurrent,
+        verify_content_length: args.verify_content_length,
+    };
+
+    let synchronizer = Synchronizer::new(sync_options, writer_options)?;
+    synchronizer.sync().await?;
+    observability_manager.shutdown().await?;
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Run(args) => main_run(args).await,
+        Command::Sync(args) => main_sync(args).await,
         Command::Debug(debug_command) => match debug_command.command {
             DebugSubcommand::Read(args) => Ok(debug_read(args).await?),
             DebugSubcommand::Write(args) => Ok(debug_write(args).await?),

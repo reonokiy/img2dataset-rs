@@ -55,9 +55,15 @@ clap = { version = "4.5.41", features = ["derive"] }
 anyhow = "1.0.98"
 reqwest = { version = "0.12.22", default-features = false, features = [
     "stream",
-    "json",
+    "http2",
     "hickory-dns",
-    "rustls-tls",
+    "rustls-tls-webpki-roots",
+    "charset",
+    "gzip",
+    "brotli",
+    "zstd",
+    "deflate",
+    "json",
 ] }
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"

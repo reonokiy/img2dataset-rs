@@ -6,8 +6,8 @@ use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
 use reqwest_tracing::TracingMiddleware;
 use std::time::Duration;
 use std::{error::Error, sync::Arc};
-use tokio::sync::Semaphore;
-use tokio::task::JoinSet;
+use tokio::sync::Mutex;
+use tracing::error;
 
 use crate::sampler::{BatchSample, ShardSample};
 
@@ -55,45 +55,36 @@ impl Downloader {
     }
 
     pub async fn batch_download(&self, inputs: BatchSample) -> BatchSample {
-        let mut blobs: Vec<Vec<u8>> = vec![vec![]; inputs.len];
-        let mut set = JoinSet::new();
-        let semaphore = Arc::new(Semaphore::new(self.options.thread));
+        let blobs_arc = Arc::new(Mutex::new(vec![None; inputs.len]));
+        stream::iter(inputs.url.iter().enumerate())
+            .for_each_concurrent(self.options.thread, |(i, url)| {
+                let downloader = self.clone();
+                let blobs_clone = Arc::clone(&blobs_arc);
+                let url = url.map(|u| u.to_string());
 
-        for (i, url) in inputs.url.iter().enumerate() {
-            let permit_semaphore = Arc::clone(&semaphore);
-            let downloader = self.clone();
-            let url = url.map(|u| u.to_string());
-            set.spawn(async move {
-                let _permit = permit_semaphore
-                    .acquire()
-                    .await
-                    .expect("Failed to acquire semaphore");
-                match url {
-                    Some(url) => {
-                        let result = downloader.single_download(url).await;
-                        match result {
-                            Ok(data) => (i, Some(data)),
-                            Err(e) => (i, None),
-                        }
-                    }
-                    None => (i, None),
+                async move {
+                    let download_result = match url {
+                        Some(url_str) => match downloader.single_download(url_str.clone()).await {
+                            Ok(data) => Some(data),
+                            Err(e) => {
+                                error!("Failed to download {}: {}", url_str, e);
+                                None
+                            }
+                        },
+                        None => None,
+                    };
+
+                    let mut guard = blobs_clone.lock().await;
+                    guard[i] = download_result;
                 }
-            });
-        }
-
-        while let Some(Ok((i, blob))) = set.join_next().await {
-            match blob {
-                Some(data) => blobs[i] = data,
-                None => (),
-            }
-        }
+            })
+            .await;
 
         let mut array_builder = BinaryBuilder::new();
-        for blob in blobs {
-            if blob.is_empty() {
-                array_builder.append_null();
-            } else {
-                array_builder.append_value(blob.as_slice());
+        for blob in blobs_arc.lock().await.iter() {
+            match blob {
+                Some(data) => array_builder.append_value(data),
+                None => array_builder.append_null(),
             }
         }
         let data = array_builder.finish();
