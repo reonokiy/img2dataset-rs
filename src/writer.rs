@@ -1,13 +1,10 @@
-use crate::sampler::{ShardSample, merge_batch_samples};
+use crate::sampler::BatchSample;
 use anyhow::Result;
-use arrow::array::{Array, RecordBatch, StringArray};
-use arrow::datatypes::{DataType, Field, Schema};
 use clap::ValueEnum;
 use opendal::Operator;
 use opendal::services::{B2, Fs, S3};
 use parquet::arrow::AsyncArrowWriter;
 use std::str::FromStr;
-use std::sync::Arc;
 use tokio_util::compat::FuturesAsyncWriteCompatExt;
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -52,6 +49,7 @@ pub struct WriterOptions {
     pub b2_application_key_id: Option<String>,
     pub b2_application_key: Option<String>,
     pub shard_prefix: String,
+    pub writer_buffer: usize,
 }
 
 impl WriterOptions {
@@ -113,7 +111,7 @@ impl Writer {
         Ok(Self { op, options })
     }
 
-    pub async fn shard_write(&self, samples: ShardSample) -> Result<()> {
+    pub async fn batch_write(&self, samples: BatchSample) -> Result<()> {
         match self.options.format {
             OutputFormat::Parquet => self.write_shard_parquet(samples).await,
             _ => todo!(),
@@ -138,37 +136,13 @@ impl Writer {
         self.options.format
     }
 
-    pub async fn write_shard_parquet(&self, samples: ShardSample) -> Result<()> {
-        let merged_samples = merge_batch_samples(samples.samples)?;
-        let mut schema_vec = vec![
-            Field::new("_id", DataType::FixedSizeBinary(16), false),
-            Field::new("_url", DataType::Utf8, false),
-            Field::new("_filepath", DataType::Utf8, false),
-        ];
-        let filepath_array = StringArray::from(
-            std::iter::repeat(samples.original_filepath.clone())
-                .take(merged_samples.len)
-                .collect::<Vec<String>>(),
-        );
-        let mut array_vec: Vec<Arc<dyn Array>> = vec![
-            Arc::new(merged_samples.uuid),
-            Arc::new(merged_samples.url),
-            Arc::new(filepath_array),
-        ];
-        if let Some(bytes) = merged_samples.bytes {
-            schema_vec.push(Field::new("_data", DataType::Binary, true));
-            array_vec.push(Arc::new(bytes));
-        }
-        for (key, value) in merged_samples.additional_columns.iter() {
-            schema_vec.push(Field::new(key, value.data_type().clone(), true));
-            array_vec.push(value.clone());
-        }
-        let schema = Arc::new(Schema::new(schema_vec));
-        let batch = RecordBatch::try_new(schema.clone(), array_vec)?;
+    pub async fn write_shard_parquet(&self, samples: BatchSample) -> Result<()> {
+        let schema = samples.schema();
+        let batch = samples.batch()?;
         let writer = self
             .op
-            .writer_with(&self.get_shard_name(samples.shard_id))
-            .chunk(16 * 1024 * 1024)
+            .writer_with(&self.get_shard_name(samples.id()))
+            .chunk(self.options.writer_buffer)
             .await?;
         let mut writer = AsyncArrowWriter::try_new(
             writer.into_futures_async_write().compat_write(),

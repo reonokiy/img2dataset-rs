@@ -1,4 +1,5 @@
 use arrow::array::BinaryBuilder;
+use bytes::Bytes;
 use futures::stream::{self, StreamExt};
 use opentelemetry::{KeyValue, global};
 use reqwest::{Client, Response};
@@ -7,9 +8,9 @@ use reqwest_tracing::TracingMiddleware;
 use std::time::Duration;
 use std::{error::Error, sync::Arc};
 use tokio::sync::Mutex;
-use tracing::error;
+use tracing::{error, info};
 
-use crate::sampler::{BatchSample, ShardSample};
+use crate::sampler::BatchSample;
 
 /// The `Downloader` is responsible for downloading images from URLs.
 #[derive(Clone)]
@@ -42,21 +43,9 @@ impl Downloader {
         Self { client, options }
     }
 
-    pub async fn shard_download(&self, shard: ShardSample) -> ShardSample {
-        let downloaded_bytes = stream::iter(shard.samples.iter())
-            .then(|sample| self.batch_download(sample.clone()))
-            .collect()
-            .await;
-        ShardSample {
-            original_filepath: shard.original_filepath,
-            shard_id: shard.shard_id,
-            samples: downloaded_bytes,
-        }
-    }
-
     pub async fn batch_download(&self, inputs: BatchSample) -> BatchSample {
-        let blobs_arc = Arc::new(Mutex::new(vec![None; inputs.len]));
-        stream::iter(inputs.url.iter().enumerate())
+        let blobs_arc = Arc::new(Mutex::new(vec![None; inputs.len()]));
+        stream::iter(inputs.url().iter().enumerate())
             .for_each_concurrent(self.options.thread, |(i, url)| {
                 let downloader = self.clone();
                 let blobs_clone = Arc::clone(&blobs_arc);
@@ -67,7 +56,7 @@ impl Downloader {
                         Some(url_str) => match downloader.single_download(url_str.clone()).await {
                             Ok(data) => Some(data),
                             Err(e) => {
-                                error!("Failed to download {}: {}", url_str, e);
+                                // error!("Failed to download {}: {}", url_str, e);
                                 None
                             }
                         },
@@ -80,25 +69,12 @@ impl Downloader {
             })
             .await;
 
-        let mut array_builder = BinaryBuilder::new();
-        for blob in blobs_arc.lock().await.iter() {
-            match blob {
-                Some(data) => array_builder.append_value(data),
-                None => array_builder.append_null(),
-            }
-        }
-        let data = array_builder.finish();
-
-        BatchSample {
-            len: inputs.len,
-            uuid: inputs.uuid,
-            url: inputs.url,
-            bytes: Some(data),
-            additional_columns: inputs.additional_columns,
-        }
+        let mut sample = inputs.clone();
+        sample.put_bytes(blobs_arc.lock().await.clone());
+        sample
     }
 
-    async fn single_download(&self, url: String) -> anyhow::Result<Vec<u8>> {
+    async fn single_download(&self, url: String) -> anyhow::Result<Bytes> {
         let meter = global::meter(module_path!());
         let download_counter = meter
             .u64_counter("download.start")
@@ -143,7 +119,7 @@ impl Downloader {
             ));
         }
 
-        Ok(response.bytes().await?.to_vec())
+        Ok(response.bytes().await?)
     }
 
     fn is_disallowed(&self, response: &Response) -> bool {

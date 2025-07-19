@@ -1,6 +1,5 @@
-use crate::sampler::{BatchSample, ShardSample};
+use crate::sampler::BatchSample;
 use anyhow::anyhow;
-use arrow::array::FixedSizeBinaryBuilder;
 use arrow::array::StringArray;
 use async_stream::stream;
 use clap::ValueEnum;
@@ -38,7 +37,6 @@ pub struct ReaderOptions {
     pub url_column_name: String,
     pub save_additional_columns: bool,
     pub batch_size: usize,
-    pub batch_per_shard: usize,
     pub opendal_buffer_size: usize,
     pub file_filter: Option<glob::Pattern>,
 }
@@ -125,9 +123,9 @@ impl Reader {
         })
     }
 
-    pub async fn shard_read(
+    pub async fn batch_read(
         &self,
-    ) -> anyhow::Result<impl Stream<Item = anyhow::Result<ShardSample>>> {
+    ) -> anyhow::Result<impl Stream<Item = anyhow::Result<BatchSample>>> {
         let file_lister = self.op.lister_with("").recursive(true).await?;
         let config = self.options.clone();
         let op = self.op.clone();
@@ -191,7 +189,7 @@ async fn read_parquet_shard(
     filepath: String,
     reader: opendal::Reader,
     options: ReaderOptions,
-) -> anyhow::Result<impl Stream<Item = anyhow::Result<ShardSample>>> {
+) -> anyhow::Result<impl Stream<Item = anyhow::Result<BatchSample>>> {
     let builder =
         ParquetRecordBatchStreamBuilder::new(reader.into_futures_async_read(..).await?.compat())
             .await
@@ -215,17 +213,7 @@ async fn read_parquet_shard(
     };
 
     let stream = stream! {
-        let mut shard_sample = ShardSample {
-            original_filepath: filepath,
-            shard_id: uuid::Uuid::now_v7(),
-            samples: Vec::new(),
-        };
         while let Some(Ok(batch)) = record_batch_reader.next().await {
-            let mut uuid_builder = FixedSizeBinaryBuilder::new(16); // 16 bytes for UUID v7
-            for _ in 0..batch.num_rows() {
-                uuid_builder.append_value(&uuid::Uuid::now_v7().as_bytes())?;
-            }
-            let uuid = uuid_builder.finish();
             let url = match batch.column_by_name(&options.url_column_name)
             .expect("URL column should exist")
             .as_any().downcast_ref::<StringArray>() {
@@ -246,23 +234,7 @@ async fn read_parquet_shard(
                 );
             }
 
-            if shard_sample.samples.len() >= options.batch_per_shard {
-                shard_sample.shard_id = uuid::Uuid::now_v7();
-                yield Ok(shard_sample.clone());
-                shard_sample.samples.clear();
-            } else {
-                shard_sample.samples.push(BatchSample {
-                    len: batch.num_rows(),
-                    uuid: uuid.clone(),
-                    url: url.clone(),
-                    bytes: None,
-                    additional_columns: additional_columns,
-                });
-            }
-        }
-        if !shard_sample.samples.is_empty() {
-            shard_sample.shard_id = uuid::Uuid::now_v7();
-            yield Ok(shard_sample);
+            yield Ok(BatchSample::generate(filepath.clone(), url.clone(), additional_columns)?);
         }
     };
 

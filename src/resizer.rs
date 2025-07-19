@@ -1,8 +1,7 @@
-use crate::sampler::{BatchSample, ShardSample};
+use crate::sampler::BatchSample;
 use anyhow::{Result, anyhow};
-use arrow::array::BinaryArray;
+use bytes::Bytes;
 use clap::ValueEnum;
-use futures::future::try_join_all;
 use image::{DynamicImage, GenericImageView, imageops::FilterType};
 use rayon::prelude::*;
 use std::io::Cursor;
@@ -70,7 +69,7 @@ impl Resizer {
     }
 
     #[instrument(skip(self))]
-    pub fn single_resize(&self, bytes: Vec<u8>) -> Result<Vec<u8>> {
+    pub fn single_resize(&self, bytes: Bytes) -> Result<Bytes> {
         if !self.options.reencode && self.options.resize_mode == ResizeMode::No {
             return Ok(bytes);
         }
@@ -93,60 +92,29 @@ impl Resizer {
             }
         }
 
-        Ok(buf.into_inner())
+        Ok(Bytes::from(buf.into_inner()))
     }
 
-    #[instrument(skip(self))]
-    pub async fn batch_resize(&self, samples: BatchSample) -> Result<BatchSample> {
+    pub async fn batch_resize(&self, sample: BatchSample) -> Result<BatchSample> {
         let resizer = self.clone();
+        let mut sample_clone = sample.clone();
         let handler = spawn_blocking(move || {
-            samples
-                .bytes
+            sample
+                .bytes()
                 .par_iter()
-                .enumerate()
-                .map(|(i, data)| -> Result<(usize, Vec<u8>)> {
-                    let bytes = data.value_data();
-                    let img = resizer.single_resize(bytes.to_vec())?;
-                    Ok((i, img))
+                .map(|data| -> Option<Bytes> {
+                    match data {
+                        Some(data) => resizer.single_resize(data.clone()).ok(),
+                        None => None,
+                    }
                 })
                 .collect::<Vec<_>>()
         });
 
         let resized_data = handler.await?;
-        let mut resized_bytes = vec![Vec::new(); samples.len];
-        for result in resized_data.iter() {
-            if let Ok((i, img)) = result {
-                resized_bytes[*i] = img.clone();
-            }
-        }
-        let bytes = BinaryArray::from_vec(
-            resized_bytes
-                .iter()
-                .map(|b| b.as_slice())
-                .collect::<Vec<_>>(),
-        );
 
-        Ok(BatchSample {
-            len: samples.len,
-            uuid: samples.uuid,
-            url: samples.url,
-            bytes: Some(bytes),
-            additional_columns: samples.additional_columns,
-        })
-    }
-
-    #[instrument(skip(self))]
-    pub async fn shard_resize(&self, sample: ShardSample) -> Result<ShardSample> {
-        let resize_futures = sample
-            .samples
-            .iter()
-            .map(|sample| self.batch_resize(sample.clone()));
-        let resize_batchs = try_join_all(resize_futures).await?;
-        Ok(ShardSample {
-            original_filepath: sample.original_filepath,
-            shard_id: sample.shard_id,
-            samples: resize_batchs,
-        })
+        sample_clone.put_bytes(resized_data);
+        Ok(sample_clone)
     }
 
     /// Resizes an image using the "border" mode.

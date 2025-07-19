@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -8,279 +9,124 @@ use arrow::array::ArrayRef;
 use arrow::array::BinaryArray;
 use arrow::array::FixedSizeBinaryArray;
 use arrow::array::FixedSizeBinaryBuilder;
+use arrow::array::RecordBatch;
 use arrow::array::StringArray;
-use arrow_select::concat::concat;
+use arrow::datatypes::DataType;
+use arrow::datatypes::Field;
+use arrow::datatypes::Schema;
+use bytes::Bytes;
 
 #[derive(Debug, Clone)]
 pub struct BatchSample {
-    pub len: usize,
-    pub uuid: FixedSizeBinaryArray,
-    pub url: StringArray,
-    pub bytes: Option<BinaryArray>,
-    pub additional_columns: HashMap<String, ArrayRef>,
+    original_filepath: String,
+    shard_id: uuid::Uuid,
+    uuid: FixedSizeBinaryArray,
+    url: StringArray,
+    bytes: Vec<Option<Bytes>>,
+    additional_columns: HashMap<String, ArrayRef>,
 }
 
 impl BatchSample {
-    pub fn from_vec(
-        urls: Vec<String>,
-        additional_columns: Option<HashMap<String, ArrayRef>>,
-    ) -> Self {
-        let len = urls.len();
-        let mut uuid_builder = FixedSizeBinaryBuilder::new(16); // 16 bytes for UUID v7
-        for _ in 0..len {
-            uuid_builder
-                .append_value(&uuid::Uuid::now_v7().as_bytes())
-                .unwrap();
+    pub fn generate(
+        filepath: String,
+        url: StringArray,
+        additional_columns: HashMap<String, ArrayRef>,
+    ) -> Result<Self> {
+        let shard_id = uuid::Uuid::now_v7();
+        let len = url.len();
+        let mut uuid_builder = FixedSizeBinaryBuilder::new(16);
+        for _ in 0..url.len() {
+            uuid_builder.append_value(&shard_id.as_bytes()).unwrap();
         }
         let uuid_array = uuid_builder.finish();
-        let url_builder = StringArray::from(urls);
-
-        BatchSample {
-            len,
-            uuid: uuid_array,
-            url: url_builder,
-            bytes: None,
-            additional_columns: additional_columns.unwrap_or_default(),
+        for (_, value) in additional_columns.iter() {
+            if value.len() != url.len() {
+                return Err(anyhow!(
+                    "Additional columns must have the same length as the URL array"
+                ));
+            }
         }
+        Ok(BatchSample {
+            original_filepath: filepath,
+            shard_id: shard_id,
+            uuid: uuid_array,
+            url: url,
+            bytes: vec![None; len],
+            additional_columns: additional_columns,
+        })
     }
-}
 
-#[derive(Debug, Clone)]
-pub struct ShardSample {
-    pub original_filepath: String,
-    pub shard_id: uuid::Uuid,
-    pub samples: Vec<BatchSample>,
-}
-
-impl ShardSample {
     pub fn get_valid_bytes_count(&self) -> usize {
-        self.samples
-            .iter()
-            .map(|s| s.bytes.as_ref().map(|b| s.len - b.null_count()))
-            .sum::<Option<usize>>()
-            .unwrap_or(0)
+        let mut count = 0;
+        for value in self.bytes.iter() {
+            if value.is_some() {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    pub fn id(&self) -> uuid::Uuid {
+        self.shard_id
+    }
+
+    pub fn url(&self) -> &StringArray {
+        &self.url
+    }
+
+    pub fn put_bytes(&mut self, bytes: Vec<Option<Bytes>>) {
+        self.bytes = bytes;
+    }
+
+    pub fn bytes(&self) -> &[Option<Bytes>] {
+        &self.bytes
     }
 
     pub fn len(&self) -> usize {
-        self.samples.iter().map(|s| s.len).sum()
-    }
-}
-
-pub fn merge_batch_samples(batch_samples: Vec<BatchSample>) -> Result<BatchSample> {
-    if batch_samples.is_empty() {
-        return Err(anyhow!("Cannot merge empty batch samples"));
+        self.url.len()
     }
 
-    let uuids: Vec<&dyn Array> = batch_samples
-        .iter()
-        .map(|s| &s.uuid as &dyn Array)
-        .collect();
-    let uuid_binding = concat(&uuids)?;
-    let merged_uuid = uuid_binding
-        .as_any()
-        .downcast_ref::<FixedSizeBinaryArray>()
-        .expect("Merged ID should be UInt64Array");
-    let urls: Vec<&dyn Array> = batch_samples.iter().map(|s| &s.url as &dyn Array).collect();
-    let url_binding = concat(&urls)?;
-    let merged_url = url_binding
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .expect("Merged URL should be StringArray");
-    let has_bytes = batch_samples.iter().any(|s| s.bytes.is_some());
-    let merged_bytes = match has_bytes {
-        true => {
-            let bytes: Vec<&dyn Array> = batch_samples
-                .iter()
-                .filter_map(|s| s.bytes.as_ref().map(|b| b as &dyn Array))
-                .collect();
-            let byte_binding = concat(&bytes)?;
-            Some(
-                byte_binding
-                    .as_any()
-                    .downcast_ref::<BinaryArray>()
-                    .expect("Merged bytes should be BinaryArray")
-                    .clone(),
-            )
+    pub fn filepath(&self) -> &str {
+        &self.original_filepath
+    }
+
+    pub fn schema(&self) -> Arc<Schema> {
+        let mut schema_vec = vec![
+            Field::new("_id", DataType::FixedSizeBinary(16), false),
+            Field::new("_url", DataType::Utf8, false),
+            Field::new("_filepath", DataType::Utf8, false),
+            Field::new("_data", DataType::Binary, true),
+        ];
+        for (key, value) in self.additional_columns.iter() {
+            schema_vec.push(Field::new(key, value.data_type().clone(), true));
         }
-        false => None,
-    };
+        Arc::new(Schema::new(schema_vec))
+    }
 
-    let mut additional_columns = HashMap::new();
-    if !batch_samples.is_empty() {
-        let first_keys = batch_samples[0].additional_columns.keys();
-        for key in first_keys {
-            let columns_for_key: Vec<ArrayRef> = batch_samples
-                .iter()
-                .map(|s| {
-                    s.additional_columns
-                        .get(key)
-                        .cloned()
-                        .unwrap_or_else(|| Arc::new(StringArray::new_null(s.len)))
-                })
-                .collect();
-            let columns_for_key_refs: Vec<&dyn Array> =
-                columns_for_key.iter().map(|c| c.as_ref()).collect();
-            let merged_column = concat(&columns_for_key_refs)?;
-            additional_columns.insert(key.clone(), merged_column);
+    pub fn array(&self) -> Vec<ArrayRef> {
+        let filepath_array = StringArray::from(
+            std::iter::repeat(self.original_filepath.clone())
+                .take(self.len())
+                .collect::<Vec<String>>(),
+        );
+        let bytes_array = BinaryArray::from_iter(self.bytes.iter());
+
+        let mut array_vec: Vec<ArrayRef> = vec![
+            Arc::new(self.uuid.clone()),
+            Arc::new(self.url.clone()),
+            Arc::new(filepath_array),
+            Arc::new(bytes_array),
+        ];
+        for (_, value) in self.additional_columns.iter() {
+            array_vec.push(value.clone());
         }
+
+        array_vec
     }
 
-    Ok(BatchSample {
-        len: merged_uuid.len(),
-        uuid: merged_uuid.clone(),
-        url: merged_url.clone(),
-        bytes: merged_bytes,
-        additional_columns,
-    })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use arrow::array::{BinaryBuilder, FixedSizeBinaryBuilder, Int32Array, StringBuilder};
-    use std::sync::Arc;
-
-    fn create_test_batch_sample(
-        urls: Vec<&str>,
-        bytes_data: Option<Vec<Vec<u8>>>,
-        additional_data: Option<HashMap<String, ArrayRef>>,
-    ) -> BatchSample {
-        let len = urls.len();
-
-        // Create UUID array
-        let mut uuid_builder = FixedSizeBinaryBuilder::new(16);
-        for _ in 0..len {
-            uuid_builder
-                .append_value(&uuid::Uuid::now_v7().as_bytes())
-                .unwrap();
-        }
-        let uuid_array = uuid_builder.finish();
-
-        // Create URL array
-        let mut url_builder = StringBuilder::new();
-        for url in urls {
-            url_builder.append_value(url);
-        }
-        let url_array = url_builder.finish();
-
-        // Create bytes array if provided
-        let bytes_array = bytes_data.map(|bytes| {
-            let mut bytes_builder = BinaryBuilder::new();
-            for byte_vec in bytes {
-                bytes_builder.append_value(&byte_vec);
-            }
-            bytes_builder.finish()
-        });
-
-        BatchSample {
-            len,
-            uuid: uuid_array,
-            url: url_array,
-            bytes: bytes_array,
-            additional_columns: additional_data.unwrap_or_default(),
-        }
-    }
-
-    #[test]
-    fn test_merge_batch_samples_basic() {
-        let batch1 = create_test_batch_sample(
-            vec!["http://example.com/1", "http://example.com/2"],
-            None,
-            None,
-        );
-
-        let batch2 = create_test_batch_sample(vec!["http://example.com/3"], None, None);
-
-        let merged = merge_batch_samples(vec![batch1, batch2]).unwrap();
-
-        assert_eq!(merged.len, 3);
-        assert_eq!(merged.url.len(), 3);
-        assert_eq!(merged.url.value(0), "http://example.com/1");
-        assert_eq!(merged.url.value(1), "http://example.com/2");
-        assert_eq!(merged.url.value(2), "http://example.com/3");
-    }
-
-    #[test]
-    fn test_merge_batch_samples_with_bytes() {
-        let bytes1 = vec![vec![1, 2, 3], vec![4, 5, 6]];
-        let bytes2 = vec![vec![7, 8, 9]];
-
-        let batch1 = create_test_batch_sample(
-            vec!["http://example.com/1", "http://example.com/2"],
-            Some(bytes1),
-            None,
-        );
-
-        let batch2 = create_test_batch_sample(vec!["http://example.com/3"], Some(bytes2), None);
-
-        let merged = merge_batch_samples(vec![batch1, batch2]).unwrap();
-
-        assert_eq!(merged.len, 3);
-        assert!(merged.bytes.is_some());
-
-        let bytes_array = merged.bytes.unwrap();
-        assert_eq!(bytes_array.value(0), &[1, 2, 3]);
-        assert_eq!(bytes_array.value(1), &[4, 5, 6]);
-        assert_eq!(bytes_array.value(2), &[7, 8, 9]);
-    }
-
-    #[test]
-    fn test_merge_batch_samples_with_additional_columns() {
-        // Create additional columns for batch1
-        let mut additional1 = HashMap::new();
-        let id_array1 = Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef;
-        additional1.insert("id".to_string(), id_array1);
-
-        // Create additional columns for batch2
-        let mut additional2 = HashMap::new();
-        let id_array2 = Arc::new(Int32Array::from(vec![3])) as ArrayRef;
-        additional2.insert("id".to_string(), id_array2);
-
-        let batch1 = create_test_batch_sample(
-            vec!["http://example.com/1", "http://example.com/2"],
-            None,
-            Some(additional1),
-        );
-
-        let batch2 =
-            create_test_batch_sample(vec!["http://example.com/3"], None, Some(additional2));
-
-        let merged = merge_batch_samples(vec![batch1, batch2]).unwrap();
-
-        assert_eq!(merged.len, 3);
-        assert!(merged.additional_columns.contains_key("id"));
-
-        let id_column = merged.additional_columns.get("id").unwrap();
-        let id_array = id_column.as_any().downcast_ref::<Int32Array>().unwrap();
-        assert_eq!(id_array.value(0), 1);
-        assert_eq!(id_array.value(1), 2);
-        assert_eq!(id_array.value(2), 3);
-    }
-
-    #[test]
-    fn test_merge_batch_samples_empty_input() {
-        let result = merge_batch_samples(vec![]);
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("Cannot merge empty batch samples")
-        );
-    }
-
-    #[test]
-    fn test_merge_batch_samples_single_batch() {
-        let batch = create_test_batch_sample(
-            vec!["http://example.com/1", "http://example.com/2"],
-            None,
-            None,
-        );
-
-        let original_len = batch.len;
-        let merged = merge_batch_samples(vec![batch]).unwrap();
-
-        assert_eq!(merged.len, original_len);
-        assert_eq!(merged.url.len(), 2);
+    pub fn batch(&self) -> Result<RecordBatch> {
+        let schema = self.schema();
+        let array = self.array();
+        RecordBatch::try_new(schema, array).map_err(|e| anyhow::anyhow!(e))
     }
 }

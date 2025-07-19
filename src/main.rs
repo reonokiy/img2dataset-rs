@@ -2,9 +2,8 @@ use crate::downloader::{Downloader, DownloaderOptions};
 use crate::observability::{ObservabilityManager, ObservabilityOptions};
 use crate::reader::{InputFormat, Reader, ReaderBackend, ReaderOptions};
 use crate::resizer::{ImageFormat, ResizeMode, ResizerOptions};
-use crate::sampler::{BatchSample, ShardSample};
 use crate::sync::{SyncOptions, Synchronizer};
-use crate::writer::{OutputBackend, OutputFormat, Writer, WriterOptions};
+use crate::writer::{OutputBackend, OutputFormat, WriterOptions};
 use anyhow::Result;
 use anyhow::anyhow;
 use clap::{Parser, Subcommand};
@@ -81,8 +80,6 @@ struct Args {
     reader_hf_revision: Option<String>,
     #[clap(long, default_value_t = 1024)]
     reader_batch_size: usize,
-    #[clap(long, default_value_t = 8)]
-    reader_batch_per_shard: usize,
     #[clap(long, default_value_t = 16 * 1024 * 1024)]
     reader_opendal_buffer_size: usize,
     #[clap(long)]
@@ -131,12 +128,14 @@ struct Args {
     writer_b2_application_key: Option<String>,
     #[clap(long, default_value = "")]
     writer_shard_prefix: String,
+    #[clap(long, default_value_t = 16 * 1024 * 1024)]
+    writer_buffer: usize,
 
     // Downloader options
     #[clap(long, default_values_t = vec!["noai".to_string(), "noimageai".to_string(), "noindex".to_string(), "noimageindex".to_string()])]
     disallowed_header_directives: Vec<String>,
     #[clap(long, default_value_t = 16)]
-    downloader_concurrency: usize,
+    downloader_concurrency_per_batch: usize,
     #[clap(long, default_value_t = 10)]
     timeout: u64,
     #[clap(long, default_value_t = 0)]
@@ -149,7 +148,17 @@ struct Args {
 
     // Pipeline options
     #[clap(long, default_value_t = 4)]
-    shard_concurrency: usize,
+    downloader_concurrency: usize,
+    #[clap(long, default_value_t = 4)]
+    resizer_concurrency: usize,
+    #[clap(long, default_value_t = 4)]
+    writer_concurrency: usize,
+    #[clap(long, default_value_t = 32)]
+    reader_buffer_size: usize,
+    #[clap(long, default_value_t = 8)]
+    downloader_buffer_size: usize,
+    #[clap(long, default_value_t = 8)]
+    resizer_buffer_size: usize,
 
     // Observability options
     #[clap(value_enum, long, default_value = "info")]
@@ -188,6 +197,8 @@ struct SyncArgs {
     writer_b2_application_key: Option<String>,
     #[clap(long, default_value = "")]
     writer_shard_prefix: String,
+    #[clap(long, default_value_t = 16 * 1024 * 1024)]
+    writer_buffer: usize,
 
     // Sync Specific Options
     #[clap(long)]
@@ -251,7 +262,6 @@ async fn debug_read(args: Args) -> Result<()> {
         url_column_name: args.reader_url_column_name,
         save_additional_columns: args.reader_save_additional_columns,
         batch_size: args.reader_batch_size,
-        batch_per_shard: args.reader_batch_per_shard,
         opendal_buffer_size: args.reader_opendal_buffer_size,
         file_filter: args
             .reader_file_filter
@@ -259,7 +269,7 @@ async fn debug_read(args: Args) -> Result<()> {
     };
 
     let downloader_options = DownloaderOptions {
-        thread: args.downloader_concurrency,
+        thread: args.downloader_concurrency_per_batch,
         timeout: args.timeout,
         retries: args.retries,
         user_agent: args.user_agent,
@@ -270,7 +280,7 @@ async fn debug_read(args: Args) -> Result<()> {
         .map_err(|e| anyhow!("Failed to create reader: {}", e.to_string()))?;
     let downloader = Downloader::new(downloader_options);
     let mut stream = reader
-        .shard_read()
+        .batch_read()
         .await
         .map_err(|e| anyhow!("Failed to stream samples: {}", e.to_string()))?;
 
@@ -280,7 +290,7 @@ async fn debug_read(args: Args) -> Result<()> {
         count += 1;
         match sample {
             Ok(s) => {
-                downloader.shard_download(s.clone()).await;
+                downloader.batch_download(s.clone()).await;
                 tracing::debug!("Processing sample {}: {:?}", count, s);
             }
             Err(e) => {
@@ -300,41 +310,7 @@ async fn debug_read(args: Args) -> Result<()> {
 }
 
 async fn debug_write(args: Args) -> Result<()> {
-    let writer_options = WriterOptions {
-        root: args.writer_root,
-        format: args.writer_format,
-        backend: args.writer_backend,
-        s3_bucket: args.writer_s3_bucket,
-        s3_region: args.writer_s3_region,
-        s3_access_key: args.writer_s3_access_key,
-        s3_secret_key: args.writer_s3_secret_key,
-        s3_endpoint: args.writer_s3_endpoint,
-        b2_bucket: args.writer_b2_bucket,
-        b2_bucket_id: args.writer_b2_bucket_id,
-        b2_application_key_id: args.writer_b2_application_key_id,
-        b2_application_key: args.writer_b2_application_key,
-        shard_prefix: args.writer_shard_prefix,
-    };
-    let writer = Writer::new(writer_options)?;
-
-    let urls1 = vec![
-        "https://example.com/image1.jpg".to_string(),
-        "https://example.com/image2.jpg".to_string(),
-    ];
-    let urls2 = vec![
-        "https://example.com/image3.jpg".to_string(),
-        "https://example.com/image4.jpg".to_string(),
-    ];
-    let batch_sample1 = BatchSample::from_vec(urls1, None);
-    let batch_sample2 = BatchSample::from_vec(urls2, None);
-    let shard = ShardSample {
-        original_filepath: "test_shard.parquet".to_string(),
-        shard_id: uuid::Uuid::now_v7(),
-        samples: vec![batch_sample1, batch_sample2],
-    };
-    writer.shard_write(shard).await?;
-
-    Ok(())
+    todo!()
 }
 
 async fn main_run(args: Args) -> Result<()> {
@@ -360,7 +336,6 @@ async fn main_run(args: Args) -> Result<()> {
         huggingface_revision: args.reader_hf_revision,
         save_additional_columns: args.reader_save_additional_columns,
         batch_size: args.reader_batch_size,
-        batch_per_shard: args.reader_batch_per_shard,
         opendal_buffer_size: args.reader_opendal_buffer_size,
         file_filter: args
             .reader_file_filter
@@ -368,7 +343,7 @@ async fn main_run(args: Args) -> Result<()> {
     };
 
     let downloader_options = DownloaderOptions {
-        thread: args.downloader_concurrency,
+        thread: args.downloader_concurrency_per_batch,
         timeout: args.timeout,
         retries: args.retries,
         user_agent: args.user_agent,
@@ -399,6 +374,7 @@ async fn main_run(args: Args) -> Result<()> {
         b2_application_key_id: args.writer_b2_application_key_id,
         b2_application_key: args.writer_b2_application_key,
         shard_prefix: args.writer_shard_prefix,
+        writer_buffer: args.writer_buffer,
     };
 
     let pipeline_options = pipeline::PipelineOptions {
@@ -406,7 +382,12 @@ async fn main_run(args: Args) -> Result<()> {
         downloader_options,
         resizer_options,
         writer_options,
-        concurrency: args.shard_concurrency,
+        downloader_concurrency: args.downloader_concurrency_per_batch,
+        resizer_concurrency: args.resizer_concurrency,
+        writer_concurrency: args.writer_concurrency,
+        reader_buffer_size: args.reader_buffer_size,
+        downloader_buffer_size: args.downloader_buffer_size,
+        resizer_buffer_size: args.resizer_buffer_size,
     };
 
     pipeline::pipeline(pipeline_options).await?;
@@ -437,6 +418,7 @@ async fn main_sync(args: SyncArgs) -> Result<()> {
         b2_application_key_id: args.writer_b2_application_key_id,
         b2_application_key: args.writer_b2_application_key,
         shard_prefix: args.writer_shard_prefix,
+        writer_buffer: args.writer_buffer,
     };
 
     let sync_options = SyncOptions {
