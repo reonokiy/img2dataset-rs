@@ -221,6 +221,10 @@ struct SyncArgs {
     #[clap(long, default_value_t = true)]
     verify_content_length: bool,
 
+    // Sync concurrency
+    #[clap(long, default_value_t = 4)]
+    sync_concurrency: usize,
+
     // Observability options
     #[clap(value_enum, long, default_value = "info")]
     log_level: tracing::Level,
@@ -444,6 +448,7 @@ async fn main_sync(args: SyncArgs) -> Result<()> {
         reader_concurrent: args.reader_concurrent,
         writer_concurrent: args.writer_concurrent,
         verify_content_length: args.verify_content_length,
+        concurrency: args.sync_concurrency,
     };
 
     let synchronizer = Synchronizer::new(sync_options, writer_options)?;

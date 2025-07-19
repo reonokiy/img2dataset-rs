@@ -2,7 +2,7 @@ use crate::writer::WriterOptions;
 use anyhow::Result;
 use async_stream::stream;
 use chrono::Utc;
-use futures::pin_mut;
+
 use futures::{Stream, StreamExt};
 use opendal::{Operator, services::Fs};
 use parquet::arrow::async_writer::AsyncFileWriter;
@@ -21,6 +21,7 @@ pub struct SyncOptions {
     pub reader_concurrent: usize,
     pub writer_concurrent: usize,
     pub verify_content_length: bool,
+    pub concurrency: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -118,13 +119,22 @@ impl Synchronizer {
 
     pub async fn sync(&self) -> Result<()> {
         let stream = self.list_to_sync().await?;
-        pin_mut!(stream);
-        while let Some(path) = stream.next().await {
-            if let Err(e) = self.single_sync(&path).await {
-                error!("Failed to sync {}: {}", path, e);
-            }
-            info!("Successfully synced {}", path);
-        }
+        let sync_options = self.sync_options.clone();
+
+        stream
+            .for_each_concurrent(sync_options.concurrency, |path| {
+                let self_clone = self.clone();
+
+                async move {
+                    if let Err(e) = self_clone.single_sync(&path).await {
+                        error!("Failed to sync {}: {}", path, e);
+                    } else {
+                        info!("Successfully synced {}", path);
+                    }
+                }
+            })
+            .await;
+
         Ok(())
     }
 }
