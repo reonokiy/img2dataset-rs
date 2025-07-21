@@ -36,7 +36,7 @@ impl BatchSample {
         let len = url.len();
         let mut uuid_builder = FixedSizeBinaryBuilder::new(16);
         for _ in 0..url.len() {
-            uuid_builder.append_value(&shard_id.as_bytes()).unwrap();
+            uuid_builder.append_value(uuid::Uuid::now_v7()).unwrap();
         }
         let uuid_array = uuid_builder.finish();
         for (_, value) in additional_columns.iter() {
