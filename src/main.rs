@@ -78,12 +78,14 @@ struct Args {
     reader_hf_dataset_repo_id: Option<String>,
     #[clap(long)]
     reader_hf_revision: Option<String>,
-    #[clap(long, default_value_t = 1024)]
+    #[clap(long, default_value_t = 256)]
     reader_batch_size: usize,
     #[clap(long, default_value_t = 16 * 1024 * 1024)]
     reader_opendal_buffer_size: usize,
     #[clap(long)]
     reader_file_filter: Option<String>,
+    #[clap(long, default_value_t = 4)]
+    reader_concurrency: usize,
 
     // Resizer options
     #[clap(long, default_value_t = false)]
@@ -134,11 +136,11 @@ struct Args {
     // Downloader options
     #[clap(long, default_values_t = vec!["noai".to_string(), "noimageai".to_string(), "noindex".to_string(), "noimageindex".to_string()])]
     disallowed_header_directives: Vec<String>,
-    #[clap(long, default_value_t = 16)]
-    downloader_concurrency_per_batch: usize,
+    #[clap(long, default_value_t = 64)]
+    max_concurrent_downloads: usize,
     #[clap(long, default_value_t = 10)]
     timeout: u64,
-    #[clap(long, default_value_t = 0)]
+    #[clap(long, default_value_t = 1)]
     retries: u32,
     #[clap(
         long,
@@ -155,9 +157,9 @@ struct Args {
     writer_concurrency: usize,
     #[clap(long, default_value_t = 32)]
     reader_buffer_size: usize,
-    #[clap(long, default_value_t = 8)]
+    #[clap(long, default_value_t = 32)]
     downloader_buffer_size: usize,
-    #[clap(long, default_value_t = 8)]
+    #[clap(long, default_value_t = 32)]
     resizer_buffer_size: usize,
 
     // Observability options
@@ -266,10 +268,11 @@ async fn debug_read(args: Args) -> Result<()> {
         file_filter: args
             .reader_file_filter
             .map(|f| glob::Pattern::new(&f).unwrap()),
+        reader_concurrency: args.reader_concurrency,
     };
 
     let downloader_options = DownloaderOptions {
-        thread: args.downloader_concurrency_per_batch,
+        max_concurrent_downloads: args.max_concurrent_downloads,
         timeout: args.timeout,
         retries: args.retries,
         user_agent: args.user_agent,
@@ -340,10 +343,11 @@ async fn main_run(args: Args) -> Result<()> {
         file_filter: args
             .reader_file_filter
             .map(|f| glob::Pattern::new(&f).unwrap()),
+        reader_concurrency: args.reader_concurrency,
     };
 
     let downloader_options = DownloaderOptions {
-        thread: args.downloader_concurrency_per_batch,
+        max_concurrent_downloads: args.max_concurrent_downloads,
         timeout: args.timeout,
         retries: args.retries,
         user_agent: args.user_agent,
@@ -382,7 +386,7 @@ async fn main_run(args: Args) -> Result<()> {
         downloader_options,
         resizer_options,
         writer_options,
-        downloader_concurrency: args.downloader_concurrency_per_batch,
+        downloader_concurrency: args.downloader_concurrency,
         resizer_concurrency: args.resizer_concurrency,
         writer_concurrency: args.writer_concurrency,
         reader_buffer_size: args.reader_buffer_size,

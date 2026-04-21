@@ -9,8 +9,7 @@ use opendal::services::S3;
 use opendal::{Operator, services::Fs};
 use parquet::arrow::ParquetRecordBatchStreamBuilder;
 use std::collections::HashMap;
-use std::sync::Arc;
-use tokio::sync::Mutex;
+use std::pin::Pin;
 use tokio_util::compat::FuturesAsyncReadCompatExt;
 use tracing::instrument;
 
@@ -39,6 +38,7 @@ pub struct ReaderOptions {
     pub batch_size: usize,
     pub opendal_buffer_size: usize,
     pub file_filter: Option<glob::Pattern>,
+    pub reader_concurrency: usize,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -58,19 +58,10 @@ impl InputFormat {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum FileReadState {
-    NotStarted,
-    Reading,
-    Completed,
-    Error,
-}
-
 #[derive(Debug, Clone)]
 pub struct Reader {
     op: Operator,
     options: ReaderOptions,
-    read_state: Arc<Mutex<HashMap<String, FileReadState>>>,
 }
 
 impl Reader {
@@ -116,71 +107,61 @@ impl Reader {
             }
         };
 
-        Ok(Self {
-            op,
-            options,
-            read_state: Arc::new(Mutex::new(HashMap::new())),
-        })
+        Ok(Self { op, options })
     }
 
     pub async fn batch_read(
         &self,
     ) -> anyhow::Result<impl Stream<Item = anyhow::Result<BatchSample>>> {
         let file_lister = self.op.lister_with("").recursive(true).await?;
-        let config = self.options.clone();
+        let filter_config = self.options.clone();
+        let read_config = self.options.clone();
         let op = self.op.clone();
+        let reader_concurrency = self.options.reader_concurrency;
 
-        let stream_of_streams = stream! {
+        // Stream of file paths matching the filter
+        let file_stream = stream! {
             let mut file_lister = file_lister;
             while let Some(Ok(file)) = file_lister.next().await {
-                if let Some(filter) = &config.file_filter {
+                if let Some(filter) = &filter_config.file_filter {
                     if !filter.matches(file.name()) {
                         continue;
                     }
                 }
-                if file.name().ends_with(config.format.extension()) {
-                    {
-                        let filepath = file.path();
-                        let mut state = self.read_state.lock().await;
-                        if !state.contains_key(filepath) || state.get(filepath) == Some(&FileReadState::NotStarted) {
-                            state.insert(filepath.to_string(), FileReadState::Reading);
-                        }
-                    }
+                if file.name().ends_with(filter_config.format.extension()) {
+                    yield file.path().to_string();
+                }
+            }
+        };
 
-                    let path = file.path().to_string();
-                    let reader = op.reader_with(&path.clone()).chunk(self.options.opendal_buffer_size).await?;
-                    let batch = match config.format {
+        // Read multiple files concurrently via buffer_unordered,
+        // then flatten the per-file batch streams into a single stream
+        let batch_stream = file_stream
+            .map(move |path: String| {
+                let op = op.clone();
+                let config = read_config.clone();
+                async move {
+                    tracing::debug!("Opening file: {}", path);
+                    let reader = op
+                        .reader_with(&path)
+                        .chunk(config.opendal_buffer_size)
+                        .await
+                        .map_err(|e| anyhow!("Failed to open {}: {}", path, e))?;
+                    match config.format {
                         InputFormat::Txt => {
                             todo!()
                         }
                         InputFormat::Csv => {
                             todo!()
                         }
-                        InputFormat::Parquet => {
-                            read_parquet_shard(path.clone(), reader, config.clone()).await
-                        }
-                    };
-
-                    {
-                        let mut state = self.read_state.lock().await;
-                        match &batch {
-                            Ok(_) => {
-                                state.insert(path.clone(), FileReadState::Completed);
-                            }
-                            Err(e) => {
-                                tracing::error!("Error reading shard from {}: {}", path, e);
-                                state.insert(path.clone(), FileReadState::Error);
-                            }
-                        }
+                        InputFormat::Parquet => read_parquet_shard(path, reader, config).await,
                     }
-
-                    yield batch;
                 }
-            }
-        };
+            })
+            .buffer_unordered(reader_concurrency)
+            .try_flatten();
 
-        let flattened_stream = stream_of_streams.try_flatten();
-        Ok(Box::pin(flattened_stream))
+        Ok(Box::pin(batch_stream))
     }
 }
 
@@ -189,7 +170,7 @@ async fn read_parquet_shard(
     filepath: String,
     reader: opendal::Reader,
     options: ReaderOptions,
-) -> anyhow::Result<impl Stream<Item = anyhow::Result<BatchSample>>> {
+) -> anyhow::Result<Pin<Box<dyn Stream<Item = anyhow::Result<BatchSample>> + Send>>> {
     let builder =
         ParquetRecordBatchStreamBuilder::new(reader.into_futures_async_read(..).await?.compat())
             .await
@@ -238,5 +219,5 @@ async fn read_parquet_shard(
         }
     };
 
-    Ok(stream)
+    Ok(Box::pin(stream))
 }

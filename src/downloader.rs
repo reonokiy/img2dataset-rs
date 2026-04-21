@@ -1,14 +1,12 @@
-use arrow::array::BinaryBuilder;
 use bytes::Bytes;
 use futures::stream::{self, StreamExt};
-use opentelemetry::{KeyValue, global};
 use reqwest::{Client, Response};
 use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
 use reqwest_tracing::TracingMiddleware;
+use std::error::Error;
+use std::sync::Arc;
 use std::time::Duration;
-use std::{error::Error, sync::Arc};
-use tokio::sync::Mutex;
-use tracing::{error, info};
+use tokio::sync::Semaphore;
 
 use crate::sampler::BatchSample;
 
@@ -17,11 +15,12 @@ use crate::sampler::BatchSample;
 pub struct Downloader {
     client: ClientWithMiddleware,
     options: DownloaderOptions,
+    semaphore: Arc<Semaphore>,
 }
 
 #[derive(Debug, Clone)]
 pub struct DownloaderOptions {
-    pub thread: usize,
+    pub max_concurrent_downloads: usize,
     pub timeout: u64,
     pub user_agent: String,
     pub disallowed_header_directives: Vec<String>,
@@ -30,58 +29,91 @@ pub struct DownloaderOptions {
 
 impl Downloader {
     pub fn new(options: DownloaderOptions) -> Self {
+        let semaphore = Arc::new(Semaphore::new(options.max_concurrent_downloads));
         let reqwest_client = Client::builder()
             .user_agent(options.user_agent.clone())
             .timeout(Duration::from_secs(options.timeout))
+            .connect_timeout(Duration::from_secs(5))
+            .pool_max_idle_per_host(100)
+            .pool_idle_timeout(Duration::from_secs(90))
+            .tcp_keepalive(Duration::from_secs(30))
+            .tcp_nodelay(true)
+            .http2_adaptive_window(true)
             .build()
             .expect("Failed to create HTTP client");
         let client = ClientBuilder::new(reqwest_client)
-            // Insert the tracing middleware
             .with(TracingMiddleware::default())
             .build();
 
-        Self { client, options }
+        Self {
+            client,
+            options,
+            semaphore,
+        }
     }
 
-    pub async fn batch_download(&self, inputs: BatchSample) -> BatchSample {
-        let blobs_arc = Arc::new(Mutex::new(vec![None; inputs.len()]));
-        stream::iter(inputs.url().iter().enumerate())
-            .for_each_concurrent(self.options.thread, |(i, url)| {
+    pub async fn batch_download(&self, mut inputs: BatchSample) -> BatchSample {
+        let len = inputs.len();
+        let urls: Vec<Option<String>> = inputs
+            .url()
+            .iter()
+            .map(|u| u.map(|s| s.to_string()))
+            .collect();
+
+        let results: Vec<Option<Bytes>> = stream::iter(urls.into_iter().enumerate())
+            .map(|(i, url)| {
                 let downloader = self.clone();
-                let blobs_clone = Arc::clone(&blobs_arc);
-                let url = url.map(|u| u.to_string());
-
                 async move {
-                    let download_result = match url {
-                        Some(url_str) => match downloader.single_download(url_str.clone()).await {
-                            Ok(data) => Some(data),
-                            Err(e) => {
-                                // error!("Failed to download {}: {}", url_str, e);
-                                None
+                    match url {
+                        Some(url_str) => {
+                            let _permit = downloader.semaphore.acquire().await.unwrap();
+                            match downloader.single_download(url_str).await {
+                                Ok(data) => (i, Some(data)),
+                                Err(_) => (i, None),
                             }
-                        },
-                        None => None,
-                    };
-
-                    let mut guard = blobs_clone.lock().await;
-                    guard[i] = download_result;
+                        }
+                        None => (i, None),
+                    }
                 }
+            })
+            .buffer_unordered(len)
+            .fold(vec![None; len], |mut acc, (i, result)| async move {
+                acc[i] = result;
+                acc
             })
             .await;
 
-        let mut sample = inputs.clone();
-        sample.put_bytes(blobs_arc.lock().await.clone());
-        sample
+        inputs.put_bytes(results);
+        inputs
     }
 
     async fn single_download(&self, url: String) -> anyhow::Result<Bytes> {
-        let meter = global::meter(module_path!());
-        let download_counter = meter
-            .u64_counter("download.start")
-            .with_description("Counter for download start events")
-            .build();
+        let mut last_err = None;
+        let max_attempts = self.options.retries + 1;
 
-        let response = match self.client.get(&url).send().await {
+        for attempt in 0..max_attempts {
+            match self.try_download(&url).await {
+                Ok(bytes) => return Ok(bytes),
+                Err(e) => {
+                    if attempt + 1 < max_attempts {
+                        tracing::debug!(
+                            "Retry {}/{} for {}: {}",
+                            attempt + 1,
+                            max_attempts,
+                            url,
+                            e
+                        );
+                    }
+                    last_err = Some(e);
+                }
+            }
+        }
+
+        Err(last_err.unwrap())
+    }
+
+    async fn try_download(&self, url: &str) -> anyhow::Result<Bytes> {
+        let response = match self.client.get(url).send().await {
             Ok(resp) => resp,
             Err(e) => {
                 return Err(anyhow::anyhow!(
@@ -91,18 +123,7 @@ impl Downloader {
                 ));
             }
         };
-        download_counter.add(
-            1,
-            &[
-                KeyValue::new("url", url.clone()),
-                KeyValue::new("user_agent", self.options.user_agent.clone()),
-                KeyValue::new("status", response.status().to_string()),
-                KeyValue::new(
-                    "content_length",
-                    response.content_length().unwrap_or(0).to_string(),
-                ),
-            ],
-        );
+
         if self.is_disallowed(&response) {
             tracing::debug!("Download {} disallowed by X-Robots-Tag", url);
             return Err(anyhow::anyhow!(

@@ -95,12 +95,14 @@ impl Resizer {
         Ok(Bytes::from(buf.into_inner()))
     }
 
-    pub async fn batch_resize(&self, sample: BatchSample) -> Result<BatchSample> {
+    pub async fn batch_resize(
+        &self,
+        mut sample: BatchSample,
+    ) -> std::result::Result<BatchSample, (anyhow::Error, BatchSample)> {
         let resizer = self.clone();
-        let mut sample_clone = sample.clone();
+        let bytes_to_resize: Vec<Option<Bytes>> = sample.bytes().to_vec();
         let handler = spawn_blocking(move || {
-            sample
-                .bytes()
+            bytes_to_resize
                 .par_iter()
                 .map(|data| -> Option<Bytes> {
                     match data {
@@ -111,10 +113,13 @@ impl Resizer {
                 .collect::<Vec<_>>()
         });
 
-        let resized_data = handler.await?;
-
-        sample_clone.put_bytes(resized_data);
-        Ok(sample_clone)
+        match handler.await {
+            Ok(resized_data) => {
+                sample.put_bytes(resized_data);
+                Ok(sample)
+            }
+            Err(e) => Err((anyhow::anyhow!(e), sample)),
+        }
     }
 
     /// Resizes an image using the "border" mode.

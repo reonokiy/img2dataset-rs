@@ -188,15 +188,14 @@ pub async fn pipeline(options: PipelineOptions) -> Result<()> {
                 let counter = resizer_counter_clone.clone();
 
                 async move {
-                    let resized_shard_result = resizer.batch_resize(downloaded_shard.clone()).await;
-                    let shard_to_write = match resized_shard_result {
+                    let shard_to_write = match resizer.batch_resize(downloaded_shard).await {
                         Ok(resized) => {
                             counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             resized
                         }
-                        Err(e) => {
+                        Err((e, original)) => {
                             tracing::error!("Error resizing shard, writing original: {}", e);
-                            downloaded_shard
+                            original
                         }
                     };
                     if tx_resize.send(shard_to_write).await.is_err() {
@@ -234,6 +233,11 @@ pub async fn pipeline(options: PipelineOptions) -> Result<()> {
                     let failure_count = downloaded.len() as u64 - success_count;
                     success_counter.fetch_add(success_count, std::sync::atomic::Ordering::Relaxed);
                     failure_counter.fetch_add(failure_count, std::sync::atomic::Ordering::Relaxed);
+
+                    if success_count == 0 {
+                        tracing::debug!("Skipping batch with 0 successful downloads.");
+                        return;
+                    }
 
                     if tx_download.send(downloaded).await.is_err() {
                         tracing::warn!("Resize channel closed, could not send downloaded shard.");
